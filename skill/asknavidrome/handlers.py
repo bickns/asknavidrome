@@ -9,13 +9,23 @@ by this file (speech sanitisation, playback logging, the background
 queue-fill worker) live here too, rather than in a separate utils
 module, since nothing outside handlers.py needs them.
 
-Shared state (the play queue, the background-fill process) lives in
-state.py; connection, logger, and config constants live in config.py;
-free-text search resolution lives in search.py. This file imports from
-all three rather than owning any of that itself.
+Every handler that touches the play queue extracts device_id from the
+request and calls state.get_play_queue(device_id) to get THAT DEVICE's
+queue, not a shared one - see state.py for why. Handler-support
+functions that need the queue (log_playback_start,
+refill_queue_with_similar, _start_background_fill) take it as a
+parameter rather than re-deriving device_id themselves, since the
+calling handler has already fetched it once.
+
+Shared state (per-device play queues, per-device background-fill
+processes) lives in state.py; connection, logger, and config constants
+live in config.py; free-text search resolution lives in search.py.
+This file imports from all three rather than owning any of that
+itself.
 """
 
 from multiprocessing import Process
+from datetime import datetime
 import random
 
 from ask_sdk_core.dispatch_components import AbstractRequestHandler
@@ -40,6 +50,19 @@ from asknavidrome.search import (
 #
 # Handler-support helper functions
 #
+
+def _short_device_id(device_id: str) -> str:
+    """Truncate a device_id down to its last 8 characters for log
+    readability - full device IDs run 150+ characters, too long to be
+    useful inline in every log line, but the tail is enough to tell
+    devices apart when correlating concurrent test sessions.
+
+    :param str device_id: The full Alexa device ID
+    :return: The last 8 characters, or the whole string if shorter
+    :rtype: str
+    """
+    return device_id[-8:] if device_id else 'unknown'
+
 
 def get_resolved_slot_value(slot):
     """Get the canonical (synonym-resolved) value for a custom-type
@@ -99,16 +122,17 @@ def sanitise_speech_output(speech_string: str) -> str:
 
 
 def log_incoming_request(handler_input: HandlerInput) -> None:
-    """Log the request type, intent name (if any), and every filled
-    slot value, for every incoming request - regardless of whether it
-    ends up matching a handler. This is the single source of truth for
-    "what did Amazon actually send us", so a routing mismatch or a
-    silently-unmatched request is visible in the log rather than
-    looking identical to nothing having happened at all.
+    """Log the device ID, request type, intent name (if any), and every
+    filled slot value, for every incoming request - regardless of
+    whether it ends up matching a handler. The device ID (truncated)
+    is included so concurrent multi-device sessions can be traced
+    apart in the log.
 
     :param handler_input: The current request's HandlerInput
     :return: None
     """
+    device_id = handler_input.request_envelope.context.system.device.device_id
+    short_id = _short_device_id(device_id)
     req_type = get_request_type(handler_input)
 
     if req_type == 'IntentRequest':
@@ -122,26 +146,27 @@ def log_incoming_request(handler_input: HandlerInput) -> None:
         else:
             slot_summary = '(no slots)'
 
-        logger.info(f'Incoming request: IntentRequest -> {intent_name} | {slot_summary}')
+        logger.info(f'[device ...{short_id}] IntentRequest -> {intent_name} | {slot_summary}')
     else:
-        logger.info(f'Incoming request: {req_type}')
+        logger.info(f'[device ...{short_id}] {req_type}')
 
 
-def log_playback_start(speech: str) -> None:
+def log_playback_start(play_queue, speech: str) -> None:
     """Log what's about to play, plus the next 10 queued tracks, whenever
     a playback response is sent to Alexa - for visibility into queue
     behaviour that the Test-tab simulator doesn't show.
 
+    :param play_queue: This device's MediaQueue instance
     :param str speech: The speech text being sent (unused directly, kept
         for call-site symmetry / possible future use)
     :return: None
     """
 
-    current = state.play_queue.get_current_track()
+    current = play_queue.get_current_track()
     if current:
         logger.info(f'Playing track: {current.title} by: {current.artist} (album: {current.album})')
 
-    upcoming = list(state.play_queue.get_current_queue())[:10]
+    upcoming = list(play_queue.get_current_queue())[:10]
     if upcoming:
         logger.info('Next in queue:')
         for i, track in enumerate(upcoming, 1):
@@ -150,10 +175,11 @@ def log_playback_start(speech: str) -> None:
         logger.info('Queue is empty after this track.')
 
 
-def refill_queue_with_similar(current_track) -> bool:
+def refill_queue_with_similar(play_queue, current_track) -> bool:
     """When the queue runs dry, keep playback going by queueing songs
     similar to whatever was last playing, rather than erroring out.
 
+    :param play_queue: This device's MediaQueue instance
     :param current_track: The Track that just finished/is ending
     :return: True if similar songs were found and queued, False otherwise
     :rtype: bool
@@ -168,8 +194,8 @@ def refill_queue_with_similar(current_track) -> bool:
     if not similar_ids:
         return False
 
-    controller.enqueue_songs(connection, state.play_queue, similar_ids)
-    state.play_queue.sync()
+    controller.enqueue_songs(connection, play_queue, similar_ids)
+    play_queue.sync()
     logger.info(f'Queue was empty - added {len(similar_ids)} similar songs to continue playback')
     return True
 
@@ -194,26 +220,31 @@ def queue_worker_thread(connection: object, play_queue: object, song_id_list: li
     logger.debug('Finished playlist processing!')
 
 
-def _start_background_fill(song_id_list: list) -> None:
+def _start_background_fill(play_queue, device_id: str, song_id_list: list) -> None:
     """Enqueue the first track(s) synchronously (fast enough to stay
     within Alexa's 8-second response window), then spawn a background
     process to enqueue the rest, if there's more than one track.
-    Replaces any previously-running background fill via
-    state.stop_background_process(). Safe for a song_id_list of any
-    length >= 1, including exactly 1 - a single-track "album" match
-    (e.g. a compilation that resolves to just one track) previously
-    crashed here with an IndexError.
+    Tracks the spawned process against THIS device's ID via
+    state.set_background_process(), so a later request from the same
+    device can find and stop it - and so it never gets confused with
+    another device's own background fill.
 
+    Safe for a song_id_list of any length >= 1, including exactly 1 -
+    a single-track "album" match (e.g. a compilation that resolves to
+    just one track) previously crashed here with an IndexError.
+
+    :param play_queue: This device's MediaQueue instance
+    :param str device_id: The Alexa device ID for the current request
     :param list song_id_list: Full ordered list of song IDs to queue
     :return: None
     """
     if len(song_id_list) > 1:
-        controller.enqueue_songs(connection, state.play_queue, [song_id_list[0], song_id_list[1]])
-        bg = Process(target=queue_worker_thread, args=(connection, state.play_queue, song_id_list[2:]))
+        controller.enqueue_songs(connection, play_queue, [song_id_list[0], song_id_list[1]])
+        bg = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))
         bg.start()
-        state.set_background_process(bg)
+        state.set_background_process(device_id, bg)
     else:
-        controller.enqueue_songs(connection, state.play_queue, [song_id_list[0]])
+        controller.enqueue_songs(connection, play_queue, [song_id_list[0]])
 
 
 #
@@ -326,7 +357,9 @@ class NaviSonicPlayMusicByArtist(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicPlayMusicByArtist')
-        state.stop_background_process()
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
+        state.stop_background_process(device_id)
 
         artist = get_slot_value_v2(handler_input, 'artist')
         artist_lookup = fuzzy_search_artist(artist.value)
@@ -340,18 +373,18 @@ class NaviSonicPlayMusicByArtist(AbstractRequestHandler):
         else:
             artist_album_lookup = connection.albums_by_artist(artist_lookup[0].get('id'))
             song_id_list = connection.build_song_list_from_albums(artist_album_lookup, min_song_count)
-            state.play_queue.clear()
+            play_queue.clear()
 
-            _start_background_fill(song_id_list)
+            _start_background_fill(play_queue, device_id, song_id_list)
 
             speech = sanitise_speech_output(f'Playing music by: {artist.value}')
             logger.info(speech)
 
             card = {'title': 'AskNavidrome', 'text': speech}
 
-            state.play_queue.shuffle()
-            track_details = state.play_queue.get_next_track()
-            log_playback_start(speech)
+            play_queue.shuffle()
+            track_details = play_queue.get_next_track()
+            log_playback_start(play_queue, speech)
             return controller.start_playback('play', speech, card, track_details, handler_input)
 
 
@@ -368,7 +401,9 @@ class NaviSonicShuffleArtist(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicShuffleArtist')
-        state.stop_background_process()
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
+        state.stop_background_process(device_id)
 
         artist = get_slot_value_v2(handler_input, 'artist')
         artist_lookup = fuzzy_search_artist(artist.value)
@@ -382,13 +417,13 @@ class NaviSonicShuffleArtist(AbstractRequestHandler):
         song_id_list = connection.build_song_list_from_albums(artist_album_lookup, -1)  # unlimited - full catalogue
         random.shuffle(song_id_list)
 
-        state.play_queue.clear()
-        _start_background_fill(song_id_list)
+        play_queue.clear()
+        _start_background_fill(play_queue, device_id, song_id_list)
 
         speech = sanitise_speech_output(f'Shuffling all songs by {artist.value}')
         card = {'title': 'AskNavidrome', 'text': speech}
-        track_details = state.play_queue.get_next_track()
-        log_playback_start(speech)
+        track_details = play_queue.get_next_track()
+        log_playback_start(play_queue, speech)
 
         return controller.start_playback('play', speech, card, track_details, handler_input)
 
@@ -405,7 +440,9 @@ class NaviSonicPlaySimilar(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicPlaySimilar')
-        state.stop_background_process()
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
+        state.stop_background_process(device_id)
 
         song = get_slot_value_v2(handler_input, 'song')
         song_results = fuzzy_search_song(song.value)
@@ -424,18 +461,18 @@ class NaviSonicPlaySimilar(AbstractRequestHandler):
         similar_ids = connection.get_similar_songs(song_id, 100)
         combined = [song_id] + [s for s in similar_ids if s != song_id]
 
-        state.play_queue.clear()
+        play_queue.clear()
 
         if len(combined) > 1:
-            _start_background_fill(combined)
+            _start_background_fill(play_queue, device_id, combined)
             speech = sanitise_speech_output(f'Playing {song_title} by {song_artist} and similar songs')
         else:
-            controller.enqueue_songs(connection, state.play_queue, [combined[0]])
+            controller.enqueue_songs(connection, play_queue, [combined[0]])
             speech = sanitise_speech_output(f'Playing {song_title} by {song_artist}')
 
         card = {'title': 'AskNavidrome', 'text': speech}
-        track_details = state.play_queue.get_next_track()
-        log_playback_start(speech)
+        track_details = play_queue.get_next_track()
+        log_playback_start(play_queue, speech)
 
         return controller.start_playback('play', speech, card, track_details, handler_input)
 
@@ -453,7 +490,9 @@ class NaviSonicPlayMusicByDecade(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicPlayMusicByDecade')
-        state.stop_background_process()
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
+        state.stop_background_process(device_id)
 
         decade = get_slot_value_v2(handler_input, 'decade')
         genre = get_slot_value_v2(handler_input, 'genre')
@@ -479,13 +518,13 @@ class NaviSonicPlayMusicByDecade(AbstractRequestHandler):
 
         song_id_list = [s.get('id') for s in songs]
 
-        state.play_queue.clear()
-        _start_background_fill(song_id_list)
+        play_queue.clear()
+        _start_background_fill(play_queue, device_id, song_id_list)
 
         speech = sanitise_speech_output(f'Playing {description}')
         card = {'title': 'AskNavidrome', 'text': speech}
-        track_details = state.play_queue.get_next_track()
-        log_playback_start(speech)
+        track_details = play_queue.get_next_track()
+        log_playback_start(play_queue, speech)
 
         return controller.start_playback('play', speech, card, track_details, handler_input)
 
@@ -501,7 +540,9 @@ class NaviSonicPlayAlbumByArtist(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicPlayAlbumByArtist')
-        state.stop_background_process()
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
+        state.stop_background_process(device_id)
 
         artist = get_slot_value_v2(handler_input, 'artist')
         album = get_slot_value_v2(handler_input, 'album')
@@ -514,7 +555,6 @@ class NaviSonicPlayAlbumByArtist(AbstractRequestHandler):
             if artist_lookup is None:
                 text = sanitise_speech_output(f"I couldn't find the artist {artist.value} in the collection.")
                 handler_input.response_builder.speak(text).ask(text)
-
                 return handler_input.response_builder.response
 
             else:
@@ -524,18 +564,17 @@ class NaviSonicPlayAlbumByArtist(AbstractRequestHandler):
                 if not result:
                     text = sanitise_speech_output(f"I couldn't find an album called {album.value} by {artist.value} in the collection.")
                     handler_input.response_builder.speak(text).ask(text)
-
                     return handler_input.response_builder.response
 
                 song_id_list = connection.build_song_list_from_albums(result, -1)
-                state.play_queue.clear()
-                _start_background_fill(song_id_list)
+                play_queue.clear()
+                _start_background_fill(play_queue, device_id, song_id_list)
 
                 speech = sanitise_speech_output(f'Playing {album.value} by: {artist.value}')
                 logger.info(speech)
                 card = {'title': 'AskNavidrome', 'text': speech}
-                track_details = state.play_queue.get_next_track()
-                log_playback_start(speech)
+                track_details = play_queue.get_next_track()
+                log_playback_start(play_queue, speech)
 
                 return controller.start_playback('play', speech, card, track_details, handler_input)
 
@@ -547,7 +586,6 @@ class NaviSonicPlayAlbumByArtist(AbstractRequestHandler):
             if result is None:
                 text = sanitise_speech_output(f"I couldn't find the album {album.value} in the collection.")
                 handler_input.response_builder.speak(text).ask(text)
-
                 return handler_input.response_builder.response
 
             else:
@@ -557,17 +595,14 @@ class NaviSonicPlayAlbumByArtist(AbstractRequestHandler):
 
                 song_id_list, description = expand_single_track_album(song_id_list, album.value)
 
-                state.play_queue.clear()
-                _start_background_fill(song_id_list)
+                play_queue.clear()
+                _start_background_fill(play_queue, device_id, song_id_list)
 
                 speech = sanitise_speech_output(f'Playing {description}')
                 logger.info(speech)
-
-                speech = sanitise_speech_output(f'Playing {album.value}')
-                logger.info(speech)
                 card = {'title': 'AskNavidrome', 'text': speech}
-                track_details = state.play_queue.get_next_track()
-                log_playback_start(speech)
+                track_details = play_queue.get_next_track()
+                log_playback_start(play_queue, speech)
 
                 return controller.start_playback('play', speech, card, track_details, handler_input)
 
@@ -584,7 +619,9 @@ class NaviSonicPlaySearch(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicPlaySearch')
-        state.stop_background_process()
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
+        state.stop_background_process(device_id)
 
         query = get_slot_value_v2(handler_input, 'query')
         song_id_list, description = resolve_search(query)
@@ -594,17 +631,13 @@ class NaviSonicPlaySearch(AbstractRequestHandler):
             handler_input.response_builder.speak(text).ask(text)
             return handler_input.response_builder.response
 
-        state.play_queue.clear()
-
-        if len(song_id_list) > 1:
-            _start_background_fill(song_id_list)
-        else:
-            controller.enqueue_songs(connection, state.play_queue, [song_id_list[0]])
+        play_queue.clear()
+        _start_background_fill(play_queue, device_id, song_id_list)
 
         speech = sanitise_speech_output(f'Playing {description}')
         card = {'title': 'AskNavidrome', 'text': speech}
-        track_details = state.play_queue.get_next_track()
-        log_playback_start(speech)
+        track_details = play_queue.get_next_track()
+        log_playback_start(play_queue, speech)
 
         return controller.start_playback('play', speech, card, track_details, handler_input)
 
@@ -622,6 +655,8 @@ class NaviSonicQueueSearch(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicQueueSearch')
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
 
         query = get_slot_value_v2(handler_input, 'query')
         song_id_list, description = resolve_search(query)
@@ -631,8 +666,8 @@ class NaviSonicQueueSearch(AbstractRequestHandler):
             handler_input.response_builder.speak(text).ask(text)
             return handler_input.response_builder.response
 
-        controller.enqueue_songs(connection, state.play_queue, song_id_list)
-        state.play_queue.sync()
+        controller.enqueue_songs(connection, play_queue, song_id_list)
+        play_queue.sync()
 
         speech = sanitise_speech_output(f'Added {description} to the queue')
         handler_input.response_builder.speak(speech)
@@ -650,7 +685,9 @@ class NaviSonicPlayPlaylist(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicPlayPlaylist')
-        state.stop_background_process()
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
+        state.stop_background_process(device_id)
 
         playlist = get_slot_value_v2(handler_input, 'playlist')
         playlist_id = connection.search_playlist(playlist.value)
@@ -663,14 +700,14 @@ class NaviSonicPlayPlaylist(AbstractRequestHandler):
 
         else:
             song_id_list = connection.build_song_list_from_playlist(playlist_id)
-            state.play_queue.clear()
-            _start_background_fill(song_id_list)
+            play_queue.clear()
+            _start_background_fill(play_queue, device_id, song_id_list)
 
             speech = sanitise_speech_output('Playing playlist ' + str(playlist.value))
             logger.info(speech)
             card = {'title': 'AskNavidrome', 'text': speech}
-            track_details = state.play_queue.get_next_track()
-            log_playback_start(speech)
+            track_details = play_queue.get_next_track()
+            log_playback_start(play_queue, speech)
 
             return controller.start_playback('play', speech, card, track_details, handler_input)
 
@@ -686,7 +723,9 @@ class NaviSonicPlayMusicByGenre(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicPlayMusicByGenre')
-        state.stop_background_process()
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
+        state.stop_background_process(device_id)
 
         genre = get_slot_value_v2(handler_input, 'genre')
         song_id_list = connection.build_song_list_from_genre(genre.value, min_song_count)
@@ -699,14 +738,14 @@ class NaviSonicPlayMusicByGenre(AbstractRequestHandler):
 
         else:
             random.shuffle(song_id_list)
-            state.play_queue.clear()
-            _start_background_fill(song_id_list)
+            play_queue.clear()
+            _start_background_fill(play_queue, device_id, song_id_list)
 
             speech = sanitise_speech_output(f'Playing {genre.value} music')
             logger.info(speech)
             card = {'title': 'AskNavidrome', 'text': speech}
-            track_details = state.play_queue.get_next_track()
-            log_playback_start(speech)
+            track_details = play_queue.get_next_track()
+            log_playback_start(play_queue, speech)
 
             return controller.start_playback('play', speech, card, track_details, handler_input)
 
@@ -722,7 +761,9 @@ class NaviSonicPlayMusicRandom(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicPlayMusicRandom')
-        state.stop_background_process()
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
+        state.stop_background_process(device_id)
 
         song_id_list = connection.build_random_song_list(min_song_count)
 
@@ -734,14 +775,14 @@ class NaviSonicPlayMusicRandom(AbstractRequestHandler):
 
         else:
             random.shuffle(song_id_list)
-            state.play_queue.clear()
-            _start_background_fill(song_id_list)
+            play_queue.clear()
+            _start_background_fill(play_queue, device_id, song_id_list)
 
             speech = sanitise_speech_output('Playing random music')
             logger.info(speech)
             card = {'title': 'AskNavidrome', 'text': speech}
-            track_details = state.play_queue.get_next_track()
-            log_playback_start(speech)
+            track_details = play_queue.get_next_track()
+            log_playback_start(play_queue, speech)
 
             return controller.start_playback('play', speech, card, track_details, handler_input)
 
@@ -757,7 +798,9 @@ class NaviSonicPlayFavouriteSongs(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicPlayFavouriteSongs')
-        state.stop_background_process()
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
+        state.stop_background_process(device_id)
 
         song_id_list = connection.build_song_list_from_favourites()
 
@@ -769,14 +812,14 @@ class NaviSonicPlayFavouriteSongs(AbstractRequestHandler):
 
         else:
             random.shuffle(song_id_list)
-            state.play_queue.clear()
-            _start_background_fill(song_id_list)
+            play_queue.clear()
+            _start_background_fill(play_queue, device_id, song_id_list)
 
             speech = sanitise_speech_output('Playing your favourite tracks.')
             logger.info(speech)
             card = {'title': 'AskNavidrome', 'text': speech}
-            track_details = state.play_queue.get_next_track()
-            log_playback_start(speech)
+            track_details = play_queue.get_next_track()
+            log_playback_start(play_queue, speech)
 
             return controller.start_playback('play', speech, card, track_details, handler_input)
 
@@ -792,9 +835,11 @@ class NaviSonicRandomiseQueue(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicRandomiseQueue Handler')
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
 
-        state.play_queue.shuffle()
-        state.play_queue.sync()
+        play_queue.shuffle()
+        play_queue.sync()
 
         return handler_input.response_builder.response
 
@@ -810,8 +855,10 @@ class NaviSonicSongDetails(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicSongDetails Handler')
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
 
-        current_track = state.play_queue.get_current_track()
+        current_track = play_queue.get_current_track()
 
         title = sanitise_speech_output(current_track.title)
         artist = sanitise_speech_output(current_track.artist)
@@ -834,8 +881,10 @@ class NaviSonicStarSong(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicStarSong Handler')
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
 
-        current_track = state.play_queue.get_current_track()
+        current_track = play_queue.get_current_track()
 
         song_id = current_track.id
         connection.star_entry(song_id, 'song')
@@ -854,8 +903,10 @@ class NaviSonicUnstarSong(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicUnstarSong Handler')
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
 
-        current_track = state.play_queue.get_current_track()
+        current_track = play_queue.get_current_track()
 
         song_id = current_track.id
         connection.star_entry(song_id, 'song')
@@ -897,10 +948,12 @@ class PlaybackStoppedHandler(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In PlaybackStoppedHandler')
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
 
-        state.play_queue.set_current_track_offset(handler_input.request_envelope.request.offset_in_milliseconds)
+        play_queue.set_current_track_offset(handler_input.request_envelope.request.offset_in_milliseconds)
 
-        current_track = state.play_queue.get_current_track()
+        current_track = play_queue.get_current_track()
         logger.debug(f'Stored track offset of: {current_track.offset} ms for {current_track.title}')
         logger.info('Playback stopped')
 
@@ -920,16 +973,18 @@ class PlaybackNearlyFinishedHandler(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In PlaybackNearlyFinishedHandler')
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
 
-        if len(state.play_queue.get_buffer()) == 0:
-            refill_queue_with_similar(state.play_queue.get_current_track())
+        if len(play_queue.get_buffer()) == 0:
+            refill_queue_with_similar(play_queue, play_queue.get_current_track())
 
-        if len(state.play_queue.get_buffer()) == 0:
+        if len(play_queue.get_buffer()) == 0:
             logger.info('Buffer still empty after refill attempt - nothing more to queue')
             return handler_input.response_builder.response
 
         logger.info('Queuing next track...')
-        track_details = state.play_queue.enqueue_next_track()
+        track_details = play_queue.enqueue_next_track()
         return controller.start_playback('continue', None, None, track_details, handler_input)
 
 
@@ -945,17 +1000,18 @@ class PlaybackFinishedHandler(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In PlaybackFinishedHandler')
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
 
-        from datetime import datetime
         timestamp_ms = datetime.now().timestamp()
-        current_track = state.play_queue.get_current_track()
+        current_track = play_queue.get_current_track()
         connection.scrobble(current_track.id, timestamp_ms)
 
-        if state.play_queue.get_queue_count() == 0:
-            refill_queue_with_similar(current_track)
+        if play_queue.get_queue_count() == 0:
+            refill_queue_with_similar(play_queue, current_track)
 
-        if state.play_queue.get_queue_count() > 0:
-            state.play_queue.get_next_track()
+        if play_queue.get_queue_count() > 0:
+            play_queue.get_next_track()
         else:
             logger.info('Queue and refill both empty - nothing left to play')
 
@@ -975,7 +1031,9 @@ class PausePlaybackHandler(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In PausePlaybackHandler')
-        state.play_queue.sync()
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
+        play_queue.sync()
 
         return controller.stop(handler_input)
 
@@ -992,8 +1050,10 @@ class ResumePlaybackHandler(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In ResumePlaybackHandler')
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
 
-        current_track = state.play_queue.get_current_track()
+        current_track = play_queue.get_current_track()
 
         if current_track.offset > 0:
             logger.info('Resuming ' + str(current_track.title))
@@ -1001,9 +1061,9 @@ class ResumePlaybackHandler(AbstractRequestHandler):
 
             return controller.start_playback('play', None, None, current_track, handler_input)
 
-        elif state.play_queue.get_queue_count() > 0 and current_track.offset == 0:
+        elif play_queue.get_queue_count() > 0 and current_track.offset == 0:
             logger.info('Resuming - There was no paused track, getting next track from queue')
-            track_details = state.play_queue.get_next_track()
+            track_details = play_queue.get_next_track()
 
             return controller.start_playback('play', None, None, track_details, handler_input)
 
@@ -1024,19 +1084,21 @@ class NextPlaybackHandler(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NextPlaybackHandler')
-        logger.debug(f'Queue count before next: {state.play_queue.get_queue_count()}')
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
+        logger.debug(f'Queue count before next: {play_queue.get_queue_count()}')
 
-        if state.play_queue.get_queue_count() == 0:
-            refill_queue_with_similar(state.play_queue.get_current_track())
+        if play_queue.get_queue_count() == 0:
+            refill_queue_with_similar(play_queue, play_queue.get_current_track())
 
-        if state.play_queue.get_queue_count() == 0:
+        if play_queue.get_queue_count() == 0:
             logger.info('Nothing left to play after refill attempt')
             if is_intent_name('AMAZON.NextIntent')(handler_input):
                 text = sanitise_speech_output("There's nothing else queued up.")
                 handler_input.response_builder.speak(text)
             return handler_input.response_builder.response
 
-        track_details = state.play_queue.get_next_track()
+        track_details = play_queue.get_next_track()
         track_details.offset = 0
         return controller.start_playback('play', None, None, track_details, handler_input)
 
@@ -1054,15 +1116,17 @@ class PreviousPlaybackHandler(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In PreviousPlaybackHandler')
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
 
-        if state.play_queue.get_history_count() == 0:
+        if play_queue.get_history_count() == 0:
             logger.info('No previous track in history')
             if is_intent_name('AMAZON.PreviousIntent')(handler_input):
                 text = sanitise_speech_output("There's nothing before this.")
                 handler_input.response_builder.speak(text)
             return handler_input.response_builder.response
 
-        track_details = state.play_queue.get_previous_track()
+        track_details = play_queue.get_previous_track()
         track_details.offset = 0
         return controller.start_playback('play', None, None, track_details, handler_input)
 
@@ -1078,21 +1142,23 @@ class PlaybackFailedEventHandler(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In PlaybackFailedHandler')
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
 
-        current_track = state.play_queue.get_current_track()
+        current_track = play_queue.get_current_track()
         song_id = current_track.id
 
         logger.error(f'Playback Failed: {handler_input.request_envelope.request.error}')
         logger.error(f'Failed playing track with ID: {song_id}')
 
-        if state.play_queue.get_queue_count() == 0:
-            refill_queue_with_similar(current_track)
+        if play_queue.get_queue_count() == 0:
+            refill_queue_with_similar(play_queue, current_track)
 
-        if state.play_queue.get_queue_count() == 0:
+        if play_queue.get_queue_count() == 0:
             logger.info('Nothing left to play after a playback failure and refill attempt')
             return handler_input.response_builder.response
 
-        track_details = state.play_queue.get_next_track()
+        track_details = play_queue.get_next_track()
         track_details.offset = 0
 
         return controller.start_playback('play', None, None, track_details, handler_input)

@@ -4,9 +4,10 @@ Exception handlers for the AskNavidrome Alexa skill.
 Two handlers: SystemExceptionHandler (Alexa's own reported exceptions)
 and GeneralExceptionHandler (a catch-all for anything else, including
 unhandled Python exceptions from our own code). Both log a full
-traceback and, where the request type allows it, speak back whatever
-slot values Alexa had passed - so a failed search is diagnosable from
-the spoken response alone, without needing to dig through logs.
+traceback and the truncated device ID (so a failure can be traced back
+to which Echo triggered it in multi-device testing), and speak back
+whatever slot values Alexa had passed - where the request type allows
+it, so a failed search is diagnosable from the spoken response alone.
 
 Certain request types (AudioPlayer directives, PlaybackController
 button events, System.ExceptionEncountered itself) must not receive a
@@ -69,14 +70,32 @@ def get_slot_summary(handler_input: HandlerInput) -> str:
     return ', '.join(filled)
 
 
+def _get_short_device_id(handler_input: HandlerInput) -> str:
+    """Get the last 8 characters of the current request's device ID,
+    for log readability - full device IDs run 150+ characters. Guards
+    against missing device context, since exception handlers can fire
+    for a broader range of request types than the intent handlers,
+    where context.system.device isn't always guaranteed to be present.
+
+    :param handler_input: The current request's HandlerInput
+    :return: The last 8 characters of the device ID, or 'unknown'
+    :rtype: str
+    """
+    device = handler_input.request_envelope.context.system.device
+    if device is None or not device.device_id:
+        return 'unknown'
+    return device.device_id[-8:]
+
+
 class SystemExceptionHandler(AbstractExceptionHandler):
     """Handle System.ExceptionEncountered
 
     Handles exceptions and prints error information, including a full
-    traceback, in the log. Speaks back whatever slot values Alexa passed
-    (if any), so a failed search is diagnosable from the spoken response
-    alone - except when the request type forbids a spoken response
-    entirely (see _request_forbids_speech()).
+    traceback and the device that triggered it, in the log. Speaks
+    back whatever slot values Alexa passed (if any), so a failed
+    search is diagnosable from the spoken response alone - except when
+    the request type forbids a spoken response entirely (see
+    _request_forbids_speech()).
     """
 
     def can_handle(self, handler_input: HandlerInput, exception: Exception) -> bool:
@@ -85,7 +104,8 @@ class SystemExceptionHandler(AbstractExceptionHandler):
     def handle(self, handler_input: HandlerInput, exception: Exception) -> Response:
         logger.debug('In SystemExceptionHandler')
 
-        # Log the exception, including a full traceback
+        # Log the exception, including a full traceback and device ID
+        logger.error(f'Device: ...{_get_short_device_id(handler_input)}')
         logger.error(f'System Exception: {exception}')
         logger.error(traceback.format_exc())
         logger.error(f'Request Type Was: {get_request_type(handler_input)}')
@@ -113,8 +133,9 @@ class GeneralExceptionHandler(AbstractExceptionHandler):
     """Handle general exceptions
 
     Handles exceptions and prints error information, including a full
-    traceback, in the log. Same speech-forbidding-request-type guard
-    and slot-summary speech as SystemExceptionHandler above.
+    traceback and the device that triggered it, in the log. Same
+    speech-forbidding-request-type guard and slot-summary speech as
+    SystemExceptionHandler above.
     """
 
     def can_handle(self, handler_input: HandlerInput, exception: Exception) -> bool:
@@ -123,7 +144,8 @@ class GeneralExceptionHandler(AbstractExceptionHandler):
     def handle(self, handler_input: HandlerInput, exception: Exception) -> Response:
         logger.debug('In GeneralExceptionHandler')
 
-        # Log the exception, including a full traceback
+        # Log the exception, including a full traceback and device ID
+        logger.error(f'Device: ...{_get_short_device_id(handler_input)}')
         logger.error(f'General Exception: {exception}')
         logger.error(traceback.format_exc())
         logger.error(f'Request Type Was: {get_request_type(handler_input)}')

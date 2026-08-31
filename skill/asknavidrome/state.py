@@ -1,12 +1,19 @@
 """
 Shared runtime state for the AskNavidrome web service.
 
-This module owns the multiprocessing-safe MediaQueue instance and the
-background-process handle used to populate large playlists without
-hitting Alexa's 8-second response timeout. It exists as its own module
-so that handlers.py, search.py, and app.py can all share the same
-queue and background-process reference without circular imports or
-each holding their own stale copy of a plain module-level global.
+This module owns one MediaQueue instance PER DEVICE, keyed by Alexa's
+device_id (present on every request via
+handler_input.request_envelope.context.system.device.device_id).
+Without this, two Echo devices talking to the same skill would share
+one queue and trample each other's playback state - see the
+multi-device concurrency discussion earlier in this project's history.
+
+A device's queue is created lazily, the first time it's requested -
+there's no separate "register a device" step. Queues for devices that
+stop being used are never evicted; for a personal/household-scale
+deployment this is an acceptable, deliberate simplification rather
+than an oversight - each idle queue costs a handful of empty deques
+in the manager subprocess, not meaningfully more.
 """
 
 from multiprocessing.managers import BaseManager
@@ -16,50 +23,64 @@ BaseManager.register('MediaQueue', queue.MediaQueue)
 manager = BaseManager()
 manager.start()
 
-play_queue = manager.MediaQueue()
-"""The shared MediaQueue instance used across every handler."""
+# Confirmed via direct testing that manager.MediaQueue() creates a
+# genuinely independent instance on each call, not a shared singleton -
+# each entry in this dict is a fully isolated MediaQueue.
+_queues_by_device = {}
+"""device_id -> MediaQueue instance"""
 
-# Tracks the background Process used to populate large playlists.
-# Private and accessed only via the getter/setter below - a bare
-# module-level name reassigned from another module (e.g. handlers.py
-# doing `state.background_process = ...`) would rebind the name in
-# that module's own namespace, not this one, so a proper setter is
-# needed for the reassignment to actually take effect here.
-_background_process = None
+_background_by_device = {}
+"""device_id -> Process instance, or None"""
 
 
-def get_background_process():
-    """Get the currently-tracked background Process, or None if there
-    isn't one running.
+def get_play_queue(device_id: str):
+    """Get this device's MediaQueue, creating a new one if this is the
+    first request seen from it.
 
+    :param str device_id: The Alexa device ID for the current request
+    :return: This device's MediaQueue instance
+    :rtype: MediaQueue
+    """
+    if device_id not in _queues_by_device:
+        _queues_by_device[device_id] = manager.MediaQueue()
+    return _queues_by_device[device_id]
+
+
+def get_background_process(device_id: str):
+    """Get the currently-tracked background Process for this device,
+    or None if there isn't one running.
+
+    :param str device_id: The Alexa device ID for the current request
     :return: The Process object, or None
     :rtype: multiprocessing.Process | None
     """
-    return _background_process
+    return _background_by_device.get(device_id)
 
 
-def set_background_process(process) -> None:
-    """Replace the tracked background Process.
+def set_background_process(device_id: str, process) -> None:
+    """Replace the tracked background Process for this device.
 
+    :param str device_id: The Alexa device ID for the current request
     :param process: The new Process object (or None to clear it)
     :return: None
     """
-    global _background_process
-    _background_process = process
+    _background_by_device[device_id] = process
 
 
-def stop_background_process() -> None:
-    """Terminate and join the current background Process if one is
-    running, then clear it. Safe to call even if none is running.
+def stop_background_process(device_id: str) -> None:
+    """Terminate and join this device's current background Process if
+    one is running, then clear it. Safe to call even if none is
+    running.
 
     Every playback-starting handler needs to do this before starting
     a new playlist, to avoid two background threads racing to populate
-    the queue at once.
+    the same device's queue at once.
 
+    :param str device_id: The Alexa device ID for the current request
     :return: None
     """
-    global _background_process
-    if _background_process is not None:
-        _background_process.terminate()
-        _background_process.join()
-        _background_process = None
+    proc = _background_by_device.get(device_id)
+    if proc is not None:
+        proc.terminate()
+        proc.join()
+        _background_by_device[device_id] = None
