@@ -19,7 +19,7 @@ from multiprocessing import Process
 import random
 
 from ask_sdk_core.dispatch_components import AbstractRequestHandler
-from ask_sdk_core.utils import is_request_type, is_intent_name, get_slot_value_v2
+from ask_sdk_core.utils import is_request_type, is_intent_name, get_slot_value_v2, get_intent_name, get_request_type
 from ask_sdk_core.handler_input import HandlerInput
 from ask_sdk_model import Response
 
@@ -33,6 +33,7 @@ from asknavidrome.search import (
     fuzzy_search_album,
     best_song_match,
     best_album_match,
+    expand_single_track_album,
 )
 
 
@@ -95,6 +96,35 @@ def sanitise_speech_output(speech_string: str) -> str:
         speech_string = speech_string.replace('>', '')
 
     return speech_string
+
+
+def log_incoming_request(handler_input: HandlerInput) -> None:
+    """Log the request type, intent name (if any), and every filled
+    slot value, for every incoming request - regardless of whether it
+    ends up matching a handler. This is the single source of truth for
+    "what did Amazon actually send us", so a routing mismatch or a
+    silently-unmatched request is visible in the log rather than
+    looking identical to nothing having happened at all.
+
+    :param handler_input: The current request's HandlerInput
+    :return: None
+    """
+    req_type = get_request_type(handler_input)
+
+    if req_type == 'IntentRequest':
+        intent_name = get_intent_name(handler_input)
+        slots = handler_input.request_envelope.request.intent.slots
+
+        if slots:
+            slot_summary = ', '.join(
+                f'{name}={slot.value!r}' for name, slot in slots.items() if slot
+            )
+        else:
+            slot_summary = '(no slots)'
+
+        logger.info(f'Incoming request: IntentRequest -> {intent_name} | {slot_summary}')
+    else:
+        logger.info(f'Incoming request: {req_type}')
 
 
 def log_playback_start(speech: str) -> None:
@@ -165,18 +195,25 @@ def queue_worker_thread(connection: object, play_queue: object, song_id_list: li
 
 
 def _start_background_fill(song_id_list: list) -> None:
-    """Enqueue the first two tracks synchronously (fast enough to stay
+    """Enqueue the first track(s) synchronously (fast enough to stay
     within Alexa's 8-second response window), then spawn a background
-    process to enqueue the rest. Replaces any previously-running
-    background fill via state.stop_background_process().
+    process to enqueue the rest, if there's more than one track.
+    Replaces any previously-running background fill via
+    state.stop_background_process(). Safe for a song_id_list of any
+    length >= 1, including exactly 1 - a single-track "album" match
+    (e.g. a compilation that resolves to just one track) previously
+    crashed here with an IndexError.
 
     :param list song_id_list: Full ordered list of song IDs to queue
     :return: None
     """
-    controller.enqueue_songs(connection, state.play_queue, [song_id_list[0], song_id_list[1]])
-    bg = Process(target=queue_worker_thread, args=(connection, state.play_queue, song_id_list[2:]))
-    bg.start()
-    state.set_background_process(bg)
+    if len(song_id_list) > 1:
+        controller.enqueue_songs(connection, state.play_queue, [song_id_list[0], song_id_list[1]])
+        bg = Process(target=queue_worker_thread, args=(connection, state.play_queue, song_id_list[2:]))
+        bg.start()
+        state.set_background_process(bg)
+    else:
+        controller.enqueue_songs(connection, state.play_queue, [song_id_list[0]])
 
 
 #
@@ -516,8 +553,15 @@ class NaviSonicPlayAlbumByArtist(AbstractRequestHandler):
             else:
                 best_match = best_album_match(album.value, result)
                 song_id_list = connection.build_song_list_from_albums([best_match], -1)
+                logger.info(f'NaviSonicPlayAlbumByArtist: album match "{best_match.get("name")}" (songCount={best_match.get("songCount")}) returned {len(song_id_list)} song IDs')
+
+                song_id_list, description = expand_single_track_album(song_id_list, album.value)
+
                 state.play_queue.clear()
                 _start_background_fill(song_id_list)
+
+                speech = sanitise_speech_output(f'Playing {description}')
+                logger.info(speech)
 
                 speech = sanitise_speech_output(f'Playing {album.value}')
                 logger.info(speech)

@@ -241,6 +241,34 @@ def best_song_match(query: str, songs: list) -> list:
     return sorted(songs, key=lambda s: _match_score(query, s.get('title', '')), reverse=True)
 
 
+def expand_single_track_album(song_id_list: list, fallback_description: str):
+    """If an album match collapsed to a single track, pad it out with
+    similar songs so playback doesn't stop dead after one track -
+    same treatment resolve_search's album step already applies.
+
+    :param list song_id_list: Song IDs from an album match
+    :param str fallback_description: Description to use if the song's
+        own details can't be looked up
+    :return: (song_id_list, description) - unchanged if len != 1,
+        otherwise the padded list and an updated description
+    :rtype: tuple[list, str]
+    """
+    if len(song_id_list) != 1:
+        return song_id_list, fallback_description
+
+    song_id = song_id_list[0]
+    song_details = connection.get_song_details(song_id).get('song', {})
+    song_title = song_details.get('title', fallback_description)
+    song_artist = song_details.get('artist', 'an unknown artist')
+
+    similar_ids = connection.get_similar_songs(song_id, min_song_count)
+    combined = [song_id] + [s for s in similar_ids if s != song_id]
+
+    if len(combined) > 1:
+        return combined, f'{song_title} by {song_artist} and similar songs'
+    return combined, f'{song_title} by {song_artist}'
+
+    
 def filter_to_best_matches(query: str, songs: list, threshold: float = 0.15) -> list:
     """Keep only songs whose match score is close to the best match's
     score, discarding loosely-related results.
