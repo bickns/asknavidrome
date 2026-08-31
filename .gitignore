@@ -7,3 +7,4 @@ sphinx/resources/*.dtmp
 asknavidrome.log
 test.py
 NOTES.mdasknavidrome.env
+tester.py
