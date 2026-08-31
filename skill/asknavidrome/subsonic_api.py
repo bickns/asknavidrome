@@ -121,77 +121,86 @@ class SubsonicConnection:
 
             return None
 
-    def search_artist(self, term: str) -> Union[dict, None]:
+    def search_artist(self, term: str, count: int = 10) -> Union[dict, None]:
         """Search the media server for the given artist
 
+        Uses .get() with defaults throughout when reading the response,
+        rather than bracket indexing - Navidrome can omit the 'artist'
+        key entirely from searchResult3 when there are zero matches,
+        rather than returning an empty list, so bracket indexing would
+        raise a KeyError in that case.
+
         :param str term: The name of the artist
+        :param int count: Maximum number of artists to return, defaults to 10
         :return: A dictionary of artists or None if no results are found
         :rtype: dict | None
         """
 
         self.logger.debug('In function search_artist()')
 
-        result_dict = self.conn.search3(term)
+        result_dict = self.conn.search3(term, songCount=0, albumCount=0, artistCount=count)
 
-        if len(result_dict['searchResult3']) > 0:
-            # Results found
-            result_count = len(result_dict['searchResult3']['artist'])
+        artists = result_dict.get('searchResult3', {}).get('artist', [])
 
-            self.logger.debug(f'Searching artists for term: {term} found {result_count} entries.')
+        self.logger.debug(f'Searching artists for term: {term} found {len(artists)} entries.')
 
-            if result_count > 0:
-                # Results were found
-                return result_dict['searchResult3']['artist']
+        if len(artists) > 0:
+            # Results were found
+            return artists
 
         # No results were found
         return None
 
-    def search_album(self, term: str) -> Union[dict, None]:
+    def search_album(self, term: str, count: int = 10) -> Union[dict, None]:
         """Search the media server for the given album
 
+        Uses .get() with defaults throughout when reading the response,
+        for the same reason as search_artist() above.
+
         :param str term: The name of the album
+        :param int count: Maximum number of albums to return, defaults to 10
         :return: A dictionary of albums or None if no results are found
         :rtype: dict | None
         """
 
         self.logger.debug('In function search_album()')
 
-        result_dict = self.conn.search3(term)
+        result_dict = self.conn.search3(term, songCount=0, albumCount=count, artistCount=0)
 
-        if len(result_dict['searchResult3']) > 0:
-            # Results found
-            result_count = len(result_dict['searchResult3']['album'])
+        albums = result_dict.get('searchResult3', {}).get('album', [])
 
-            self.logger.debug(f'Searching albums for term: {term} found {result_count} entries.')
+        self.logger.debug(f'Searching albums for term: {term} found {len(albums)} entries.')
 
-            if result_count > 0:
-                # Results were found
-                return result_dict['searchResult3']['album']
+        if len(albums) > 0:
+            # Results were found
+            return albums
 
         # No results were found
         return None
 
-    def search_song(self, term: str) -> Union[dict, None]:
+    def search_song(self, term: str, count: int = 50) -> Union[dict, None]:
         """Search the media server for the given song
 
+        Uses .get() with defaults throughout when reading the response,
+        for the same reason as search_artist() above.
+
         :param str term: The name of the song
+        :param int count: Maximum number of songs to return, defaults to 50
         :return: A dictionary of songs or None if no results are found
         :rtype: dict | None
         """
 
         self.logger.debug('In function search_song()')
 
-        result_dict = self.conn.search3(term)
+        result_dict = self.conn.search3(term, songCount=count, albumCount=0, artistCount=0)
 
-        if len(result_dict['searchResult3']) > 0:
-            # Results found
-            result_count = len(result_dict['searchResult3']['song'])
+        songs = result_dict.get('searchResult3', {}).get('song', [])
 
-            self.logger.debug(f'Searching songs for term: {term}, found {result_count} entries.')
+        self.logger.debug(f'Searching songs for term: {term}, found {len(songs)} entries.')
 
-            if result_count > 0:
-                # Results were found
-                return result_dict['searchResult3']['song']
+        if len(songs) > 0:
+            # Results were found
+            return songs
 
         # No results were found
         return None
@@ -220,6 +229,16 @@ class SubsonicConnection:
         Build a list of songs from the given albums, keep adding tracks
         until song_count is greater than of equal to length
 
+        Songs within each album are sorted by disc number then track number
+        before being added, so playback always starts from track 1 regardless
+        of what order the underlying API happens to list them in. Track and
+        disc numbers are explicitly cast to int via the local _to_int helper,
+        since a string/int type mismatch would either raise a TypeError or
+        (if all values happen to be strings) produce a lexicographic rather
+        than numeric sort order. Debug-level logging of the raw and sorted
+        track data is included per album, to make ordering issues
+        diagnosable directly from the log rather than by guessing.
+
         :param list[dict] albums: A list of dictionaries containing album information
         :param int length: The minimum number of songs that should be returned, if -1 there is no limit
         :return: A list of song IDs
@@ -247,11 +266,35 @@ class SubsonicConnection:
             # The list of songs should not be limited
             album_id_list = [album.get('id') for album in albums]
 
+        def _to_int(value, default):
+            """Cast value to int, falling back to default if it can't be
+            interpreted as one (e.g. None, or an empty string)."""
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
         # Get a song listing for each album
         for album_id in album_id_list:
             album_details = self.conn.getAlbum(album_id)
+            songs = album_details['album']['song']
 
-            for song_detail in album_details['album']['song']:
+            self.logger.debug(f'build_song_list_from_albums: album {album_id} returned {len(songs)} songs')
+            for s in songs:
+                self.logger.debug(
+                    f'  raw track data: title={s.get("title")!r} '
+                    f'track={s.get("track")!r} (type {type(s.get("track")).__name__}) '
+                    f'discNumber={s.get("discNumber")!r}'
+                )
+
+            # Sort by disc number then track number, so playback always
+            # starts from track 1 regardless of the order the API returned
+            # the songs in.
+            songs = sorted(songs, key=lambda s: (_to_int(s.get('discNumber'), 1), _to_int(s.get('track'), 0)))
+
+            self.logger.debug(f'build_song_list_from_albums: sorted order: {[s.get("title") for s in songs]}')
+
+            for song_detail in songs:
                 # Capture the song ID
                 song_id_list.append(song_detail.get('id'))
 
@@ -336,6 +379,63 @@ class SubsonicConnection:
         else:
             return None
 
+    def get_genre_list(self) -> list:
+        """Get a list of all genre names known to the media server
+
+        :return: A list of genre name strings (may be empty)
+        :rtype: list
+        """
+        self.logger.debug('In function get_genre_list()')
+
+        result = self.conn.getGenres()
+        genres = result.get('genres', {}).get('genre', [])
+
+        return [g.get('value') for g in genres]
+
+    def get_artist_list(self) -> list:
+        """Get a list of all artist names known to the media server, via
+        the indexed artist list.
+
+        Used to build a local cache for fuzzy spelling correction (e.g.
+        matching spoken "gipsy kings" against the correctly-tagged
+        "Gypsy Kings"). Note that Navidrome only indexes artists who are
+        the primary album artist on at least one album of their own -
+        featured/guest/compilation-only artists will not appear here even
+        though their name exists as plain-text metadata on individual
+        tracks.
+
+        :return: A list of artist name strings (may be empty)
+        :rtype: list
+        """
+        self.logger.debug('In function get_artist_list()')
+
+        result = self.conn.getArtists()
+        indexes = result.get('artists', {}).get('index', [])
+
+        names = []
+        for index in indexes:
+            for artist in index.get('artist', []):
+                name = artist.get('name')
+                if name:
+                    names.append(name)
+
+        return names
+
+    def get_similar_songs(self, id: str, count: int) -> list:
+        """Get songs similar to the given song, album, or artist ID
+
+        :param str id: The seed ID for the similarity recommendation
+        :param int count: Maximum number of similar songs to return
+        :return: A list of song IDs (may be empty if none found)
+        :rtype: list
+        """
+        self.logger.debug('In function get_similar_songs()')
+
+        result = self.conn.getSimilarSongs2(id, count)
+        similar_songs = result.get('similarSongs2', {}).get('song', [])
+
+        return [song.get('id') for song in similar_songs]
+
     def get_song_details(self, id: str) -> dict:
         """Get details about a given song ID
 
@@ -374,6 +474,26 @@ class SubsonicConnection:
         )
 
         return uri
+
+    def get_songs_by_year_range(self, from_year: int, to_year: int, genre: str = None, count: int = 500) -> list:
+        """Get songs released within a year range, optionally filtered by genre
+
+        Operates at the song level, so compilations, "best of" collections,
+        and albums where individual tracks' years differ from the release's
+        own year tag are all covered correctly.
+
+        :param int from_year: Start year (inclusive)
+        :param int to_year: End year (inclusive)
+        :param str genre: Optional genre name to filter results by
+        :param int count: Maximum number of songs to return (server cap is 500)
+        :return: A list of song dictionaries
+        :rtype: list
+        """
+        self.logger.debug('In function get_songs_by_year_range()')
+
+        result = self.conn.getRandomSongs(size=count, genre=genre, fromYear=from_year, toYear=to_year)
+
+        return result.get('randomSongs', {}).get('song', [])
 
     def star_entry(self, id: str, mode: str) -> None:
         """Add a star to the given entity

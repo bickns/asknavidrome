@@ -1,7 +1,7 @@
 {
     "interactionModel": {
         "languageModel": {
-            "invocationName": "navisonic",
+            "invocationName": "my sounds",
             "intents": [
                 {
                     "name": "AMAZON.CancelIntent",
@@ -178,6 +178,31 @@
                     ]
                 },
                 {
+                    "name": "NaviSonicPlaySearch",
+                    "slots": [
+                        {
+                            "name": "query",
+                            "type": "AMAZON.SearchQuery"
+                        }
+                    ],
+                    "samples": [
+                        "play {query}"
+                    ]
+                },
+                {
+                    "name": "NaviSonicQueueSearch",
+                    "slots": [
+                        {
+                            "name": "query",
+                            "type": "AMAZON.SearchQuery"
+                        }
+                    ],
+                    "samples": [
+                        "queue {query}",
+                        "add {query} to the queue"
+                    ]
+                },
+                {
                     "name": "NaviSonicRandomiseQueue",
                     "slots": [],
                     "samples": [
@@ -185,6 +210,25 @@
                         "randomise",
                         "shuffle",
                         "shuffle the queue"
+                    ]
+                },
+                {
+                    "name": "NaviSonicPlayMusicByDecade",
+                    "slots": [
+                        {
+                            "name": "decade",
+                            "type": "decade"
+                        },
+                        {
+                            "name": "genre",
+                            "type": "AMAZON.Genre"
+                        }
+                    ],
+                    "samples": [
+                        "play music from the {decade}",
+                        "play {decade} music",
+                        "play {genre} from the {decade}",
+                        "play {decade} {genre}"
                     ]
                 }
             ],
@@ -205,6 +249,81 @@
                         {
                             "name": {
                                 "value": "Work Music"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "name": "decade",
+                    "values": [
+                        {
+                            "name": {
+                                "value": "1920s",
+                                "synonyms": [
+                                    "nineteen twenties"
+                                ]
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "1960s",
+                                "synonyms": [
+                                    "60s",
+                                    "sixties"
+                                ]
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "1970s",
+                                "synonyms": [
+                                    "70s",
+                                    "seventies"
+                                ]
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "1980s",
+                                "synonyms": [
+                                    "80s",
+                                    "eighties"
+                                ]
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "1990s",
+                                "synonyms": [
+                                    "90s",
+                                    "nineties"
+                                ]
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "2000s",
+                                "synonyms": [
+                                    "noughties"
+                                ]
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "2010s",
+                                "synonyms": [
+                                    "tens"
+                                ]
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "2020s",
+                                "synonyms": [
+                                    "20s",
+                                    "twenties",
+                                    "twenty twenties"
+                                ]
                             }
                         }
                     ]
