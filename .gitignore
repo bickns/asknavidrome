@@ -6,4 +6,4 @@ sphinx/resources/*.bkp
 sphinx/resources/*.dtmp
 asknavidrome.log
 test.py
-NOTES.md
+NOTES.mdasknavidrome.env
