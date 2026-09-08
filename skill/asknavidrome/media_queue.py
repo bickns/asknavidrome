@@ -127,6 +127,23 @@ class MediaQueue:
 
         self.logger.debug(f'In add_track() - there are {len(self.queue)} tracks in the queue')
 
+    def set_first_previous_id(self, previous_id: str) -> None:
+        """Set the previous_id of the first track currently in the queue.
+
+        Needed when refilling an empty queue with similar songs: add_track()
+        only chains a new track's previous_id against whatever's already in
+        the queue, so the very first track added to an empty queue gets no
+        previous_id at all. Since this method runs inside the manager
+        process (unlike a get_current_queue() + local mutation, which only
+        mutates a pickled COPY of the queue and has no effect on the real
+        one), this actually takes effect.
+
+        :param str previous_id: The ID to set as the first track's previous_id
+        :return: None
+        """
+        if self.queue:
+            self.queue[0].previous_id = previous_id
+
     def shuffle(self) -> None:
         """Shuffle the queue
 

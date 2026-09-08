@@ -51,19 +51,6 @@ from asknavidrome.search import (
 # Handler-support helper functions
 #
 
-def _short_device_id(device_id: str) -> str:
-    """Truncate a device_id down to its last 8 characters for log
-    readability - full device IDs run 150+ characters, too long to be
-    useful inline in every log line, but the tail is enough to tell
-    devices apart when correlating concurrent test sessions.
-
-    :param str device_id: The full Alexa device ID
-    :return: The last 8 characters, or the whole string if shorter
-    :rtype: str
-    """
-    return device_id[-8:] if device_id else 'unknown'
-
-
 def get_resolved_slot_value(slot):
     """Get the canonical (synonym-resolved) value for a custom-type
     slot, falling back to the raw spoken value if no resolution exists.
@@ -121,6 +108,19 @@ def sanitise_speech_output(speech_string: str) -> str:
     return speech_string
 
 
+def _short_device_id(device_id: str) -> str:
+    """Truncate a device_id down to its last 8 characters for log
+    readability - full device IDs run 150+ characters, too long to be
+    useful inline in every log line, but the tail is enough to tell
+    devices apart when correlating concurrent test sessions.
+
+    :param str device_id: The full Alexa device ID
+    :return: The last 8 characters, or the whole string if shorter
+    :rtype: str
+    """
+    return device_id[-8:] if device_id else 'unknown'
+
+
 def log_incoming_request(handler_input: HandlerInput) -> None:
     """Log the device ID, request type, intent name (if any), and every
     filled slot value, for every incoming request - regardless of
@@ -154,7 +154,10 @@ def log_incoming_request(handler_input: HandlerInput) -> None:
 def log_playback_start(play_queue, speech: str) -> None:
     """Log what's about to play, plus the next 10 queued tracks, whenever
     a playback response is sent to Alexa - for visibility into queue
-    behaviour that the Test-tab simulator doesn't show.
+    behaviour that the Test-tab simulator doesn't show. Track IDs are
+    included specifically to make duplicate-track issues (the same
+    song appearing under two different IDs, e.g. from two different
+    albums) diagnosable directly from the log.
 
     :param play_queue: This device's MediaQueue instance
     :param str speech: The speech text being sent (unused directly, kept
@@ -164,13 +167,13 @@ def log_playback_start(play_queue, speech: str) -> None:
 
     current = play_queue.get_current_track()
     if current:
-        logger.info(f'Playing track: {current.title} by: {current.artist} (album: {current.album})')
+        logger.info(f'Playing track: {current.title} by: {current.artist} (album: {current.album}) [id={current.id}]')
 
     upcoming = list(play_queue.get_current_queue())[:10]
     if upcoming:
         logger.info('Next in queue:')
         for i, track in enumerate(upcoming, 1):
-            logger.info(f'  {i}. {track.title} by: {track.artist} (album: {track.album})')
+            logger.info(f'  {i}. {track.title} by: {track.artist} (album: {track.album}) [id={track.id}]')
     else:
         logger.info('Queue is empty after this track.')
 
@@ -178,6 +181,17 @@ def log_playback_start(play_queue, speech: str) -> None:
 def refill_queue_with_similar(play_queue, current_track) -> bool:
     """When the queue runs dry, keep playback going by queueing songs
     similar to whatever was last playing, rather than erroring out.
+
+    The first newly-added track needs its previous_id explicitly set
+    to current_track.id, since MediaQueue.add_track() only chains a
+    new track against whatever's already in the queue - and the queue
+    is empty precisely when this function runs, so that chaining never
+    happens on its own. This is done via play_queue.set_first_previous_id()
+    (a real method call into the manager process) rather than mutating
+    a locally-returned copy of the queue, which would have no effect on
+    the actual queue state - get_current_queue() returns a pickled COPY
+    across the multiprocessing proxy boundary, not a live reference, so
+    mutating it locally silently does nothing to the real queue.
 
     :param play_queue: This device's MediaQueue instance
     :param current_track: The Track that just finished/is ending
@@ -195,6 +209,7 @@ def refill_queue_with_similar(play_queue, current_track) -> bool:
         return False
 
     controller.enqueue_songs(connection, play_queue, similar_ids)
+    play_queue.set_first_previous_id(current_track.id)
     play_queue.sync()
     logger.info(f'Queue was empty - added {len(similar_ids)} similar songs to continue playback')
     return True
@@ -1160,5 +1175,6 @@ class PlaybackFailedEventHandler(AbstractRequestHandler):
 
         track_details = play_queue.get_next_track()
         track_details.offset = 0
+        log_playback_start(play_queue, None)
 
         return controller.start_playback('play', None, None, track_details, handler_input)
