@@ -9,3 +9,4 @@ autodocsumm
 rinohtype
 flake8
 sphinx-book-theme
+gunicorn==26.2.0

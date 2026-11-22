@@ -40,6 +40,12 @@ class MediaQueue:
         self.current_track: Track = Track()
         """Property to hold the current track object"""
 
+        self.next_committed: bool = False
+        """True once the track at the front of self.queue has already been
+        handed to Alexa as an ENQUEUE (PlaybackNearlyFinished), i.e. Alexa
+        will play it next whatever we do to the queue now. Reset whenever the
+        current track advances or the queue is cleared."""
+
     def get_current_track(self) -> Track:
         """Method to return current_track attribute
 
@@ -127,16 +133,51 @@ class MediaQueue:
 
         self.logger.debug(f'In add_track() - there are {len(self.queue)} tracks in the queue')
 
+    def add_tracks(self, tracks: list, at_front: bool = False) -> None:
+        """Add several tracks to the end, or to the front, of the queue.
+
+        When adding to the front, the tracks go ahead of everything
+        already queued - except that if the front track has already been
+        committed to Alexa (see next_committed) they go immediately
+        behind it, so Alexa's stream and this queue cannot disagree about
+        what plays next.
+
+        The previous_id chain (required for the ENQUEUE PlayBehaviour) is
+        rebuilt for the whole queue, starting from the track that is
+        currently playing, and the buffer is re-synchronised. This runs
+        inside the manager process, so the changes affect the real queue.
+
+        :param list tracks: Track objects to add, in play order
+        :param bool at_front: True to insert at the front, False to append
+        :return: None
+        """
+
+        if not tracks:
+            return
+
+        items = list(self.queue)
+
+        if at_front:
+            position = 1 if (self.next_committed and items) else 0
+            items[position:position] = tracks
+        else:
+            items.extend(tracks)
+
+        previous_id = self.current_track.id or None
+        for track in items:
+            track.previous_id = previous_id
+            previous_id = track.id
+
+        self.queue = deque(items)
+        self.sync()
+
+        self.logger.debug(f'In add_tracks() - added {len(tracks)} tracks (at_front={at_front}), {len(self.queue)} now in the queue')
+
     def set_first_previous_id(self, previous_id: str) -> None:
         """Set the previous_id of the first track currently in the queue.
 
-        Needed when refilling an empty queue with similar songs: add_track()
-        only chains a new track's previous_id against whatever's already in
-        the queue, so the very first track added to an empty queue gets no
-        previous_id at all. Since this method runs inside the manager
-        process (unlike a get_current_queue() + local mutation, which only
-        mutates a pickled COPY of the queue and has no effect on the real
-        one), this actually takes effect.
+        No longer used by the skill (add_tracks() rebuilds the whole
+        previous_id chain) but retained.
 
         :param str previous_id: The ID to set as the first track's previous_id
         :return: None
@@ -200,6 +241,10 @@ class MediaQueue:
             self.history.append(self.current_track)
             self.current_track = self.queue.popleft()
 
+        # The current track has moved on, so nothing is committed to Alexa
+        # as the next track any more
+        self.next_committed = False
+
         # Set the buffer to match the queue
         self.sync()
 
@@ -223,6 +268,8 @@ class MediaQueue:
         # Set the new current track
         self.current_track = self.history.pop()
 
+        self.next_committed = False
+
         # Set the buffer to match the queue
         self.sync()
 
@@ -233,7 +280,10 @@ class MediaQueue:
 
         Get the next track from the buffer without updating the current track
         attribute.  This allows Amazon to send the PlaybackNearlyFinished
-        request early to queue the next track while maintaining the playlist
+        request early to queue the next track while maintaining the playlist.
+
+        The track is now committed to Alexa as the next stream, so
+        next_committed is set (see add_tracks()).
 
         :return: The next track to be played
         :rtype: Track
@@ -241,7 +291,10 @@ class MediaQueue:
 
         self.logger.debug('In enqueue_next_track()')
 
-        return self.buffer.popleft()
+        track = self.buffer.popleft()
+        self.next_committed = True
+
+        return track
 
     def clear(self) -> None:
         """Clear queue, history and buffer deques
@@ -253,6 +306,7 @@ class MediaQueue:
         self.queue.clear()
         self.history.clear()
         self.buffer.clear()
+        self.next_committed = False
 
     def get_queue_count(self) -> int:
         """Get the number of tracks in the queue

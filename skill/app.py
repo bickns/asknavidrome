@@ -89,6 +89,7 @@ sb.add_request_handler(h.NaviSonicStarSong())
 sb.add_request_handler(h.NaviSonicUnstarSong())
 sb.add_request_handler(h.NaviSonicPlaySearch())
 sb.add_request_handler(h.NaviSonicQueueSearch())
+sb.add_request_handler(h.NaviSonicInsertSearch())
 
 # Register AudioPlayer Handlers
 sb.add_request_handler(h.PlaybackStartedHandler())

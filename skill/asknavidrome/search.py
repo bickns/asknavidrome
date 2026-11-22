@@ -1,16 +1,26 @@
 """
 Free-text search resolution for AskNavidrome.
 
-Handles turning whatever Alexa hands back in a NaviSonicPlaySearch or
-NaviSonicQueueSearch slot into an actual set of Navidrome song IDs.
-Subsonic's search3 API is the only real free-text search primitive
-available - there's no separate "smarter" endpoint - so everything
-here is client-side scoring and fallback logic layered on top of it:
-punctuation-normalized retry variants, local fuzzy spelling correction
-against the cached artist list, and a priority chain (song, then
-artist, then genre, then album) with a minimum match-score threshold
-at every step so a coincidental low-quality match never wins over a
-genuinely better one further down the chain.
+Handles turning whatever Alexa hands back in a NaviSonicPlaySearch,
+NaviSonicQueueSearch or NaviSonicInsertSearch slot into an actual set
+of Navidrome song IDs. Subsonic's search3 API is the only real
+free-text search primitive available - there's no separate "smarter"
+endpoint - so everything here is client-side scoring and fallback
+logic layered on top of it: punctuation-normalized retry variants,
+local fuzzy spelling correction against the cached artist list, and a
+priority chain (song, then album, then artist, then genre) with a
+minimum match-confidence score at every step so a coincidental
+low-quality match never wins over a genuinely better one further down
+the chain.
+
+A matched SONG resolves to exactly that one song. Choosing what to
+play after it is not done here - when the queue runs dry, handlers.py
+asks pick_similar_song() for the next song just in time.
+
+Note: this module only governs behaviour once Alexa has already
+routed a request to one of the search intents. It has no influence
+over which intent Alexa chooses to route a given utterance to in the
+first place.
 """
 
 from difflib import SequenceMatcher
@@ -145,13 +155,9 @@ def fuzzy_search_song(term: str):
 def fuzzy_search_artist(term: str):
     """Try search_artist() against normalized variants, then local fuzzy
     spelling correction, then finally fall back to inspecting song
-    search results directly.
-
-    The song-metadata fallback catches artists who exist as plain-text
-    metadata on tracks but were never indexed as a standalone artist
-    entity - Navidrome only indexes artists who are the primary album
-    artist on at least one album of their own, so featured/guest/
-    compilation-only artists are otherwise invisible to search_artist().
+    search results directly - this catches artists who exist as
+    plain-text metadata on tracks but were never indexed as a
+    standalone artist entity.
 
     :param str term: The artist name to search for
     :return: A list of matching artist dicts, or None if nothing matched
@@ -206,10 +212,35 @@ def fuzzy_search_album(term: str):
     return None
 
 
+def _normalize_for_comparison(text: str) -> str:
+    """Strip punctuation that commonly differs between how a title is
+    spoken and how it's actually tagged (commas, periods, apostrophes),
+    and collapse whitespace. Used by _match_score so that e.g. "paint
+    it black" and "Paint It, Black" are treated as the same string for
+    exact/startswith/contains comparison, rather than only ever being
+    comparable via a fuzzy ratio (which can't reach the score tiers
+    that represent real confidence - see _match_score).
+
+    :param str text: The string to normalize
+    :return: The normalized string
+    :rtype: str
+    """
+    text = text.lower().strip()
+    text = re.sub(r"[,.'\u2018\u2019]", '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text
+
+
 def _match_score(query: str, candidate: str) -> float:
-    """Score how well candidate matches query, for ranking search
-    results client-side rather than trusting whatever order the server
-    returned them in.
+    """Score how well candidate matches query, for ranking search results
+    client-side rather than trusting whatever order the server returned
+    them in.
+
+    Punctuation (commas, periods, apostrophes) is stripped from both
+    sides before comparing, so a trivial difference between spoken
+    phrasing and the actual tag (e.g. "paint it black" vs "Paint It,
+    Black") doesn't prevent an otherwise-exact match from reaching the
+    high-confidence score tiers.
 
     :param str query: The search term
     :param str candidate: A candidate string to score against it
@@ -218,8 +249,8 @@ def _match_score(query: str, candidate: str) -> float:
     :rtype: float
     """
 
-    q = query.lower().strip()
-    c = candidate.lower().strip()
+    q = _normalize_for_comparison(query)
+    c = _normalize_for_comparison(candidate)
 
     if q == c:
         return 4.0
@@ -230,53 +261,51 @@ def _match_score(query: str, candidate: str) -> float:
     return SequenceMatcher(None, q, c).ratio()
 
 
+def _play_count(song: dict) -> int:
+    """Get a song's play count from a search result dict.
+
+    Navidrome omits the playCount key entirely when a track has never
+    been played, so a missing (or unparseable) value is treated as 0.
+    Note the count is per Navidrome user - it reflects whichever
+    account the skill is logged in as.
+
+    :param dict song: A song dict from a Subsonic search result
+    :return: The play count, or 0 if absent
+    :rtype: int
+    """
+    try:
+        return int(song.get('playCount') or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def best_song_match(query: str, songs: list) -> list:
     """Re-order a list of song dicts so the best match to query is first.
 
+    Songs are ordered by match score first. Where scores tie exactly
+    (e.g. two different recordings both titled "September", each
+    scoring 4.0), the more-played track comes first. If play counts
+    also tie, the order the server returned them in is preserved
+    (Python's sort is stable).
+
     :param str query: The search term
     :param list songs: A list of song dicts (each must have a 'title' key)
-    :return: The same songs, sorted by descending match score
+    :return: The same songs, sorted by descending score, then play count
     :rtype: list
     """
-    return sorted(songs, key=lambda s: _match_score(query, s.get('title', '')), reverse=True)
+    return sorted(
+        songs,
+        key=lambda s: (_match_score(query, s.get('title', '')), _play_count(s)),
+        reverse=True
+    )
 
 
-def expand_single_track_album(song_id_list: list, fallback_description: str):
-    """If an album match collapsed to a single track, pad it out with
-    similar songs so playback doesn't stop dead after one track -
-    same treatment resolve_search's album step already applies.
-
-    :param list song_id_list: Song IDs from an album match
-    :param str fallback_description: Description to use if the song's
-        own details can't be looked up
-    :return: (song_id_list, description) - unchanged if len != 1,
-        otherwise the padded list and an updated description
-    :rtype: tuple[list, str]
-    """
-    if len(song_id_list) != 1:
-        return song_id_list, fallback_description
-
-    song_id = song_id_list[0]
-    song_details = connection.get_song_details(song_id).get('song', {})
-    song_title = song_details.get('title', fallback_description)
-    song_artist = song_details.get('artist', 'an unknown artist')
-
-    similar_ids = connection.get_similar_songs(song_id, min_song_count)
-    combined = [song_id] + [s for s in similar_ids if s != song_id]
-
-    if len(combined) > 1:
-        return combined, f'{song_title} by {song_artist} and similar songs'
-    return combined, f'{song_title} by {song_artist}'
-
-    
 def filter_to_best_matches(query: str, songs: list, threshold: float = 0.15) -> list:
     """Keep only songs whose match score is close to the best match's
     score, discarding loosely-related results.
 
-    Prevents e.g. 'play bad' queueing 'Bad Romance' and 'Bad Blood'
-    behind the correct 'Bad' - without this, an exact match would
-    still be followed by every other loosely-similar title Subsonic's
-    fuzzy search happened to return.
+    No longer used by resolve_search() - a song match now resolves to
+    the single best song. Retained pending dead-code cleanup.
 
     :param str query: The search term
     :param list songs: A list of song dicts
@@ -305,27 +334,106 @@ def best_album_match(query: str, albums: list):
     return max(albums, key=lambda a: _match_score(query, a.get('name', '')))
 
 
+def expand_single_track_album(song_id_list: list, fallback_description: str):
+    """If a match collapsed to a single track, pad it out with similar
+    songs so playback doesn't stop dead after one track.
+
+    No longer used by resolve_search(). Only the old
+    NaviSonicPlayAlbumByArtist handler (dead code awaiting cleanup)
+    still calls it.
+
+    :param list song_id_list: Song IDs from a match
+    :param str fallback_description: Description to use if the song's
+        own details can't be looked up
+    :return: (song_id_list, description) - unchanged if len != 1,
+        otherwise the padded list and an updated description
+    :rtype: tuple[list, str]
+    """
+    if len(song_id_list) != 1:
+        return song_id_list, fallback_description
+
+    song_id = song_id_list[0]
+    song_details = connection.get_song_details(song_id).get('song', {})
+    song_title = song_details.get('title', fallback_description)
+    song_artist = song_details.get('artist', 'an unknown artist')
+
+    similar_ids = connection.get_similar_songs(song_id, min_song_count)
+    combined = [song_id] + [s for s in similar_ids if s != song_id]
+
+    if len(combined) > 1:
+        return combined, f'{song_title} by {song_artist} and similar songs'
+    return combined, f'{song_title} by {song_artist}'
+
+
+def pick_similar_song(seed_ids: list, exclude_ids: set):
+    """Choose ONE song to play next, based on songs similar to the seeds.
+
+    Each seed is sent to Navidrome's similarity lookup. Every candidate
+    is then scored by how highly it ranks in each seed's list: a song
+    that appears near the top of several seeds' lists beats a song that
+    tops only one. This is what makes the recent songs matter, rather
+    than the first seed's list always winning. Anything in exclude_ids
+    is never chosen.
+
+    A failure looking up one seed is logged with its traceback and that
+    seed is skipped; the others carry on.
+
+    :param list seed_ids: Song IDs to seed from, most important first
+    :param set exclude_ids: Song IDs that must not be chosen
+    :return: The chosen song ID, or None if nothing qualifies
+    :rtype: str | None
+    """
+    scores = {}
+
+    for seed in seed_ids:
+        try:
+            similar = connection.get_similar_songs(seed, SEARCH_RESULT_COUNT)
+        except Exception:
+            logger.exception(f'pick_similar_song: similar-songs lookup failed for seed {seed} - skipping it')
+            similar = []
+
+        logger.info(f'pick_similar_song: seed {seed} -> {len(similar)} similar songs')
+
+        for rank, candidate in enumerate(similar):
+            if candidate in exclude_ids:
+                continue
+            scores[candidate] = scores.get(candidate, 0.0) + 1.0 / (rank + 1)
+
+    if not scores:
+        logger.info(f'pick_similar_song: no candidate left after excluding {len(exclude_ids)} songs')
+        return None
+
+    chosen = max(scores, key=scores.get)
+    logger.info(f'pick_similar_song: chose {chosen} (score {scores[chosen]:.2f}) from {len(scores)} candidates')
+    return chosen
+
+
 def resolve_search(query):
     """
-    Resolve a free-text query against songs, then artists, then genre,
-    then albums, in that priority order. Every step logs at INFO level
+    Resolve a free-text query against songs, then albums, then artists,
+    then genre, in that priority order. Every step logs at INFO level
     what was searched and how many results came back, so search
     behaviour is diagnosable directly from the log without needing
     NAVI_DEBUG turned up.
 
-    If the query contains "X by Y" phrasing, X and Y are extracted via
-    parse_query_for_artist(); the artist is looked up first, and an
-    artist-scoped song or album match is tried before falling through
-    to the generic steps below (which use the cleaned song/album text,
-    not the full noisy original query).
+    If the query contains "X by Y" phrasing, X and Y are extracted; the
+    artist is looked up first, and an artist-scoped song or album match
+    is tried before falling through to the generic steps below (which
+    use the cleaned song/album text, not the full noisy original
+    query). This artist-scoped branch keeps its own internal order
+    (song, then album) rather than following the same song/album/
+    artist/genre priority as the generic steps, since the artist is
+    already known at that point.
 
-    Every match step - including the artist-scoped song step - requires
-    a score of at least MIN_ACCEPTABLE_SCORE before being accepted.
-    Without this, a query like "greatest hits" (not a real song title)
-    could coincidentally match a handful of loosely-fuzzy-matched
-    tracks that happen to be by the right artist, and win outright
-    before the album step (which may hold the actual correct answer)
-    ever gets a chance to run.
+    A song-title or album-title match is only accepted if its score
+    meets MIN_ACCEPTABLE_SCORE - a weak fuzzy hit no longer wins by
+    default, allowing a genuinely better match further down the chain
+    to be used instead of being hijacked by a loosely-matching one.
+
+    A matched song resolves to that ONE song (highest score, then
+    most-played, see best_song_match()). Other tracks that merely share
+    the title are not included, and nothing is padded on - choosing
+    what follows is left to pick_similar_song().
 
     :param query: The Alexa slot object holding the spoken/typed query text
     :return: (song_id_list, description) or (None, None) if nothing found
@@ -353,12 +461,17 @@ def resolve_search(query):
 
             if song_dets:
                 song_dets = best_song_match(search_text, song_dets)
-                top_score = _match_score(search_text, song_dets[0].get('title', ''))
-                logger.info(f'resolve_search: artist-scoped SONG step best match "{song_dets[0].get("title")}" scored {top_score:.2f} against "{search_text}"')
+                best = song_dets[0]
+                top_score = _match_score(search_text, best.get('title', ''))
+                logger.info(
+                    f'resolve_search: artist-scoped SONG step best match "{best.get("title")}" '
+                    f'(album: {best.get("album")!r}, playCount={_play_count(best)}) '
+                    f'scored {top_score:.2f} against "{search_text}"'
+                )
 
                 if top_score >= MIN_ACCEPTABLE_SCORE:
-                    logger.info(f'resolve_search: matched via artist-scoped SONG step - "{song_dets[0].get("title")}"')
-                    return [item.get('id') for item in song_dets], f'{search_text} by {artist_text}'
+                    logger.info(f'resolve_search: matched via artist-scoped SONG step - "{best.get("title")}"')
+                    return [best.get('id')], f'{best.get("title")} by {best.get("artist", artist_text)}'
                 else:
                     logger.info(f'resolve_search: artist-scoped SONG step score too weak ({top_score:.2f} < {MIN_ACCEPTABLE_SCORE}) - trying album instead')
 
@@ -387,15 +500,39 @@ def resolve_search(query):
     logger.info(f'resolve_search: SONG step for "{search_text}" -> {len(song_results) if song_results else 0} matches')
     if song_results:
         song_results = best_song_match(search_text, song_results)
-        top_score = _match_score(search_text, song_results[0].get('title', ''))
-        logger.info(f'resolve_search: SONG step best match "{song_results[0].get("title")}" scored {top_score:.2f}')
+        best = song_results[0]
+        top_score = _match_score(search_text, best.get('title', ''))
+        logger.info(
+            f'resolve_search: SONG step best match "{best.get("title")}" '
+            f'by {best.get("artist")!r} (album: {best.get("album")!r}) scored {top_score:.2f} '
+            f'(playCount={_play_count(best)})'
+        )
 
         if top_score >= MIN_ACCEPTABLE_SCORE:
-            song_results = filter_to_best_matches(search_text, song_results)
-            logger.info(f'resolve_search: SONG step accepted - {len(song_results)} tracks after filtering to best matches')
-            return [item.get('id') for item in song_results], search_text
+            logger.info(f'resolve_search: SONG step accepted - "{best.get("title")}" by {best.get("artist")!r}')
+            return [best.get('id')], f'{best.get("title")} by {best.get("artist", "an unknown artist")}'
+        else:
+            logger.info(f'resolve_search: SONG step score too weak ({top_score:.2f} < {MIN_ACCEPTABLE_SCORE}) - trying album instead')
 
-    # 2. Artist name
+    # 2. Album title
+    album_results = fuzzy_search_album(search_text)
+    logger.info(f'resolve_search: ALBUM step for "{search_text}" -> {len(album_results) if album_results else 0} matches')
+    if album_results:
+        best_album = best_album_match(search_text, album_results)
+        score = _match_score(search_text, best_album.get('name', ''))
+        logger.info(
+            f'resolve_search: ALBUM step best match "{best_album.get("name")}" '
+            f'(id={best_album.get("id")}, songCount={best_album.get("songCount")}) scored {score:.2f}'
+        )
+
+        if score >= MIN_ACCEPTABLE_SCORE:
+            song_id_list = connection.build_song_list_from_albums([best_album], -1)
+            logger.info(f'resolve_search: ALBUM step build_song_list_from_albums returned {len(song_id_list)} song IDs')
+            return song_id_list, f'the album {best_album.get("name")} by {best_album.get("artist", "an unknown artist")}'
+        else:
+            logger.info(f'resolve_search: ALBUM step score too weak ({score:.2f} < {MIN_ACCEPTABLE_SCORE}) - trying artist instead')
+
+    # 3. Artist name
     artist_results = fuzzy_search_artist(search_text)
     logger.info(f'resolve_search: ARTIST step for "{search_text}" -> {len(artist_results) if artist_results else 0} matches')
     if artist_results:
@@ -405,9 +542,9 @@ def resolve_search(query):
         random.shuffle(song_id_list)
         return song_id_list[:SEARCH_RESULT_COUNT], f'music by {search_text}'
 
-    # 3. Genre - whole-word match against known genres, catching subgenres
-    # too (e.g. "rock" also matches "hard rock") without false positives
-    # from raw substring matching.
+    # 4. Genre - last resort. Whole-word match against known genres,
+    # catching subgenres too (e.g. "rock" also matches "hard rock")
+    # without false positives from raw substring matching.
     matched_genres = [g for g in known_genres if genre_matches(search_text, g)]
     logger.info(f'resolve_search: GENRE step for "{search_text}" -> matched genres: {matched_genres}')
     if matched_genres:
@@ -418,38 +555,6 @@ def resolve_search(query):
         if all_songs:
             random.shuffle(all_songs)
             return all_songs[:SEARCH_RESULT_COUNT], f'{search_text} music'
-
-    # 4. Album title - last resort. If multiple albums matched, only the
-    # single best match is used - not every album combined together.
-    # Songs are loaded via getAlbum in proper disc/track order.
-    album_results = fuzzy_search_album(search_text)
-    logger.info(f'resolve_search: ALBUM step for "{search_text}" -> {len(album_results) if album_results else 0} matches')
-    if album_results:
-        best_album = best_album_match(search_text, album_results)
-        logger.info(
-            f'resolve_search: ALBUM step best match "{best_album.get("name")}" '
-            f'(id={best_album.get("id")}, songCount={best_album.get("songCount")})'
-        )
-        song_id_list = connection.build_song_list_from_albums([best_album], -1)
-        logger.info(f'resolve_search: ALBUM step build_song_list_from_albums returned {len(song_id_list)} song IDs')
-
-        if len(song_id_list) == 1:
-            # This "album" match is really a single track - treat it as
-            # a song and extend the queue with similar songs rather than
-            # stopping dead.
-            song_id = song_id_list[0]
-            song_details = connection.get_song_details(song_id).get('song', {})
-            song_title = song_details.get('title', search_text)
-            song_artist = song_details.get('artist', 'an unknown artist')
-            similar_ids = connection.get_similar_songs(song_id, min_song_count)
-            combined = [song_id] + [s for s in similar_ids if s != song_id]
-
-            if len(combined) > 1:
-                return combined, f'{song_title} by {song_artist} and similar songs'
-            return combined, f'{song_title} by {song_artist}'
-
-        found_artist = best_album.get('artist', 'an unknown artist')
-        return song_id_list, f'the album {search_text} by {found_artist}'
 
     logger.info(f'resolve_search: no match found for "{query.value}" at any step')
     return None, None

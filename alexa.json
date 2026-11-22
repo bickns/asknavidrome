@@ -20,10 +20,6 @@
                     "samples": []
                 },
                 {
-                    "name": "AMAZON.FallbackIntent",
-                    "samples": []
-                },
-                {
                     "name": "AMAZON.PauseIntent",
                     "samples": []
                 },
@@ -32,42 +28,12 @@
                     "samples": []
                 },
                 {
-                    "name": "NaviSonicPlayMusicByArtist",
-                    "slots": [
-                        {
-                            "name": "artist",
-                            "type": "AMAZON.Artist"
-                        }
-                    ],
-                    "samples": [
-                        "play songs by {artist}",
-                        "play music by {artist}"
-                    ]
-                },
-                {
                     "name": "AMAZON.NextIntent",
                     "samples": []
                 },
                 {
                     "name": "AMAZON.PreviousIntent",
                     "samples": []
-                },
-                {
-                    "name": "NaviSonicPlayAlbumByArtist",
-                    "slots": [
-                        {
-                            "name": "album",
-                            "type": "AMAZON.MusicAlbum"
-                        },
-                        {
-                            "name": "artist",
-                            "type": "AMAZON.Artist"
-                        }
-                    ],
-                    "samples": [
-                        "Play the album {album}",
-                        "Play the album {album} by {artist}"
-                    ]
                 },
                 {
                     "name": "NaviSonicPlayPlaylist",
@@ -124,25 +90,6 @@
                     ]
                 },
                 {
-                    "name": "NaviSonicPlaySongByArtist",
-                    "slots": [
-                        {
-                            "name": "song",
-                            "type": "AMAZON.MusicRecording"
-                        },
-                        {
-                            "name": "artist",
-                            "type": "AMAZON.Artist"
-                        }
-                    ],
-                    "samples": [
-                        "Play the song {song} by the band {artist}",
-                        "Play {song} by the band {artist}",
-                        "Play {song} by {artist}",
-                        "Play the song {song} by the artist {artist}"
-                    ]
-                },
-                {
                     "name": "NaviSonicPlayFavouriteSongs",
                     "slots": [],
                     "samples": [
@@ -186,7 +133,15 @@
                         }
                     ],
                     "samples": [
-                        "play {query}"
+                        "play {query}",
+                        "play the song {query}",
+                        "play the track {query}",
+                        "play the album {query}",
+                        "play me {query}",
+                        "put on {query}",
+                        "i want to hear {query}",
+                        "can you play {query}",
+                        "start playing {query}"
                     ]
                 },
                 {
@@ -200,6 +155,20 @@
                     "samples": [
                         "queue {query}",
                         "add {query} to the queue"
+                    ]
+                },
+                {
+                    "name": "NaviSonicInsertSearch",
+                    "slots": [
+                        {
+                            "name": "query",
+                            "type": "AMAZON.SearchQuery"
+                        }
+                    ],
+                    "samples": [
+                        "insert {query}",
+                        "add {query} next",
+                        "put {query} next"
                     ]
                 },
                 {
@@ -229,6 +198,34 @@
                         "play {decade} music",
                         "play {genre} from the {decade}",
                         "play {decade} {genre}"
+                    ]
+                },
+                {
+                    "name": "NaviSonicShuffleArtist",
+                    "slots": [
+                        {
+                            "name": "artist",
+                            "type": "AMAZON.Artist"
+                        }
+                    ],
+                    "samples": [
+                        "shuffle songs by {artist}",
+                        "shuffle {artist}",
+                        "shuffle music by {artist}"
+                    ]
+                },
+                {
+                    "name": "NaviSonicPlaySimilar",
+                    "slots": [
+                        {
+                            "name": "song",
+                            "type": "AMAZON.SearchQuery"
+                        }
+                    ],
+                    "samples": [
+                        "play {song} and similar songs",
+                        "play {song} and similar music",
+                        "play {song} and similar tunes"
                     ]
                 }
             ],
