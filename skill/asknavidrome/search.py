@@ -14,8 +14,8 @@ low-quality match never wins over a genuinely better one further down
 the chain.
 
 A matched SONG resolves to exactly that one song. Choosing what to
-play after it is not done here - when the queue runs dry, handlers.py
-asks pick_similar_song() for the next song just in time.
+play after it is not done here - handlers.py asks pick_similar_song()
+for the next song in the background, well before the queue runs dry.
 
 Note: this module only governs behaviour once Alexa has already
 routed a request to one of the search intents. It has no influence
@@ -23,9 +23,11 @@ over which intent Alexa chooses to route a given utterance to in the
 first place.
 """
 
+from concurrent.futures import ThreadPoolExecutor, wait
 from difflib import SequenceMatcher
 import random
 import re
+import time
 
 from asknavidrome.config import (
     connection,
@@ -37,6 +39,13 @@ from asknavidrome.config import (
     MIN_ACCEPTABLE_SCORE,
     ARTIST_SPELLING_CORRECTION_THRESHOLD,
 )
+
+SIMILAR_LOOKUP_COUNT = 50
+"""How many similar songs to ask Navidrome for, per seed."""
+
+SIMILAR_LOOKUP_TIMEOUT_SECONDS = 30
+"""How long pick_similar_song() waits for the per-seed lookups. A seed
+that hasn't answered by then is skipped."""
 
 
 def genre_matches(query, genre_name):
@@ -368,29 +377,51 @@ def expand_single_track_album(song_id_list: list, fallback_description: str):
 def pick_similar_song(seed_ids: list, exclude_ids: set):
     """Choose ONE song to play next, based on songs similar to the seeds.
 
-    Each seed is sent to Navidrome's similarity lookup. Every candidate
-    is then scored by how highly it ranks in each seed's list: a song
-    that appears near the top of several seeds' lists beats a song that
-    tops only one. This is what makes the recent songs matter, rather
-    than the first seed's list always winning. Anything in exclude_ids
-    is never chosen.
+    Each seed is sent to Navidrome's similarity lookup. The lookups run
+    IN PARALLEL, because each one can take several seconds on its own;
+    run one after another they would add up. A seed that has not
+    answered within SIMILAR_LOOKUP_TIMEOUT_SECONDS is skipped, and so is
+    a seed whose lookup raises an error (logged with its traceback).
 
-    A failure looking up one seed is logged with its traceback and that
-    seed is skipped; the others carry on.
+    Every candidate is then scored by how highly it ranks in each
+    seed's list: a song that appears near the top of several seeds'
+    lists beats a song that tops only one, which is what makes the
+    recent songs matter. Anything in exclude_ids is never chosen.
 
     :param list seed_ids: Song IDs to seed from, most important first
     :param set exclude_ids: Song IDs that must not be chosen
     :return: The chosen song ID, or None if nothing qualifies
     :rtype: str | None
     """
+    seeds = []
+    for seed in seed_ids:
+        if seed and seed not in seeds:
+            seeds.append(seed)
+
+    if not seeds:
+        logger.info('pick_similar_song: no seeds')
+        return None
+
+    started = time.time()
+    executor = ThreadPoolExecutor(max_workers=len(seeds))
+    futures = {seed: executor.submit(connection.get_similar_songs, seed, SIMILAR_LOOKUP_COUNT) for seed in seeds}
+    done, _not_done = wait(list(futures.values()), timeout=SIMILAR_LOOKUP_TIMEOUT_SECONDS)
+    executor.shutdown(wait=False, cancel_futures=True)
+
     scores = {}
 
-    for seed in seed_ids:
+    for seed in seeds:
+        future = futures[seed]
+
+        if future not in done:
+            logger.warning(f'pick_similar_song: lookup for seed {seed} did not finish within {SIMILAR_LOOKUP_TIMEOUT_SECONDS}s - skipping it')
+            continue
+
         try:
-            similar = connection.get_similar_songs(seed, SEARCH_RESULT_COUNT)
+            similar = future.result()
         except Exception:
             logger.exception(f'pick_similar_song: similar-songs lookup failed for seed {seed} - skipping it')
-            similar = []
+            continue
 
         logger.info(f'pick_similar_song: seed {seed} -> {len(similar)} similar songs')
 
@@ -398,6 +429,8 @@ def pick_similar_song(seed_ids: list, exclude_ids: set):
             if candidate in exclude_ids:
                 continue
             scores[candidate] = scores.get(candidate, 0.0) + 1.0 / (rank + 1)
+
+    logger.info(f'pick_similar_song: {len(seeds)} seeds looked up in parallel in {time.time() - started:.1f}s')
 
     if not scores:
         logger.info(f'pick_similar_song: no candidate left after excluding {len(exclude_ids)} songs')

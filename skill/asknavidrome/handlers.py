@@ -12,10 +12,9 @@ module, since nothing outside handlers.py needs them.
 Every handler that touches the play queue extracts device_id from the
 request and calls state.get_play_queue(device_id) to get THAT DEVICE's
 queue, not a shared one - see state.py for why. Handler-support
-functions that need the queue (log_playback_start,
-add_next_similar_song, _start_background_fill) take it as a parameter
-rather than re-deriving device_id themselves, since the calling
-handler has already fetched it once.
+functions that need the queue take it as a parameter rather than
+re-deriving device_id themselves, since the calling handler has
+already fetched it once.
 
 How the queue is fed:
 
@@ -23,20 +22,32 @@ How the queue is fed:
   queue X                   add X to the END of the queue
   insert X                  add X to the FRONT of the queue (plays next)
   play X and similar songs  flush, play X, pre-load a batch of similar songs
-  queue runs dry            add ONE similar song, just in time
+  queue runs dry            the "waiting song" is added to the queue
 
 If nothing is playing, queue and insert behave like play.
 
+The waiting song: finding a similar song can take Navidrome several
+seconds, far too long to do while Alexa is waiting for a reply. So
+whenever nothing is queued behind the current track, a background
+thread looks for ONE similar song and parks its ID in state.py (the
+"waiting song"). It is not in the queue, so it can never get in the
+way of anything the user queues or inserts. When the queue runs dry
+(NearlyFinished, Next, PlaybackFailed) the waiting song is moved into
+the queue and the next lookup starts. A new "play" flushes the queue
+and discards the waiting song.
+
 Shared state (per-device play queues, background-fill processes,
-recently finished tracks) lives in state.py; connection, logger, and
-config constants live in config.py; free-text search resolution lives
-in search.py. This file imports from all three rather than owning any
-of that itself.
+recently finished tracks, the waiting song) lives in state.py;
+connection, logger, and config constants live in config.py; free-text
+search resolution lives in search.py. This file imports from all
+three rather than owning any of that itself.
 """
 
 from multiprocessing import Process
 from datetime import datetime
 import random
+import threading
+import time
 
 from ask_sdk_core.dispatch_components import AbstractRequestHandler
 from ask_sdk_core.utils import is_request_type, is_intent_name, get_slot_value_v2, get_intent_name, get_request_type
@@ -57,9 +68,17 @@ from asknavidrome.search import (
     pick_similar_song,
 )
 
-RECENT_SEEDS_MAX = 3
-"""Number of recently finished songs (within the window kept by
-state.py) used, along with the current song, to seed the next similar song."""
+SIMILAR_SEEDS_TOTAL = 3
+"""How many songs seed the search for the waiting song: the last song
+in the queue (or the current song if the queue is empty), plus up to
+this many minus one songs that finished within
+state.RECENT_PLAYS_WINDOW_SECONDS."""
+
+SIMILAR_LOOKUP_ATTEMPTS = 5
+"""How many times the background lookup tries before giving up."""
+
+SIMILAR_LOOKUP_RETRY_SECONDS = 5
+"""Pause between background lookup attempts."""
 
 QUEUE_ADD_LIMIT = 30
 """Most tracks added by one queue/insert request while something is
@@ -242,47 +261,169 @@ def _something_is_playing(handler_input: HandlerInput, play_queue) -> bool:
     return playing
 
 
-def add_next_similar_song(play_queue, device_id: str, current_track) -> bool:
-    """When the queue has run dry, add ONE song that suits what has
-    been listened to, so playback carries on.
+def _flush_queue(play_queue, device_id: str) -> None:
+    """Empty this device's queue ready for a new "play", and throw away
+    the waiting similar song.
 
-    Seeds: the current track plus up to RECENT_SEEDS_MAX songs that
-    finished within state.RECENT_PLAYS_WINDOW_SECONDS. Never chosen:
-    the current track, the seeds, or anything in the last
-    state.RECENT_PLAYS_MAX finished tracks.
-
-    The song is added via play_queue.add_tracks(), which runs inside
-    the manager process and sets the previous_id that Alexa's ENQUEUE
-    directive requires.
+    The waiting song was chosen to follow whatever was playing before,
+    so it no longer applies. Discarding it also makes any lookup still
+    running for the old song throw its result away when it finishes.
 
     :param play_queue: This device's MediaQueue instance
     :param str device_id: The Alexa device ID for the current request
-    :param current_track: The Track that is playing / has just finished
-    :return: True if a song was added, False otherwise
-    :rtype: bool
+    :return: None
     """
+    play_queue.clear()
+    state.discard_waiting_song(device_id)
 
-    if not current_track or not current_track.id:
-        logger.info('add_next_similar_song: no current track to seed from')
-        return False
 
-    recent = state.get_recent_track_ids(device_id, RECENT_SEEDS_MAX, state.RECENT_PLAYS_WINDOW_SECONDS)
-    seeds = [current_track.id] + [r for r in recent if r != current_track.id]
+def _choose_similar_song(play_queue, device_id: str):
+    """Pick the similar song that should follow the end of the queue.
+
+    Seeds: the last song in the queue (or the current song when the
+    queue is empty), plus the most recently finished songs within
+    state.RECENT_PLAYS_WINDOW_SECONDS, SIMILAR_SEEDS_TOTAL seeds in all.
+    Never chosen: a seed, the current song, anything already queued, or
+    anything in the last state.RECENT_PLAYS_MAX finished tracks.
+
+    :param play_queue: This device's MediaQueue instance
+    :param str device_id: The Alexa device ID for the current request
+    :return: A song ID, or None if nothing suitable was found
+    :rtype: str | None
+    """
+    queued = list(play_queue.get_current_queue())
+    current = play_queue.get_current_track()
+
+    if queued:
+        anchor = queued[-1].id
+    elif current and current.id:
+        anchor = current.id
+    else:
+        logger.info('_choose_similar_song: nothing is queued or playing to seed from')
+        return None
+
+    recent = state.get_recent_track_ids(
+        device_id, limit=SIMILAR_SEEDS_TOTAL, max_age_seconds=state.RECENT_PLAYS_WINDOW_SECONDS)
+    seeds = [anchor] + [r for r in recent if r != anchor][:SIMILAR_SEEDS_TOTAL - 1]
 
     exclude = set(state.get_recent_track_ids(device_id))
     exclude.update(seeds)
+    exclude.update(track.id for track in queued)
+    if current and current.id:
+        exclude.add(current.id)
 
-    logger.info(f'add_next_similar_song: {len(seeds)} seeds, {len(exclude)} songs excluded')
+    logger.info(f'_choose_similar_song: {len(seeds)} seeds {seeds}, {len(exclude)} songs excluded')
+    return pick_similar_song(seeds, exclude)
 
-    song_id = pick_similar_song(seeds, exclude)
-    if song_id is None:
-        logger.info('add_next_similar_song: nothing suitable found')
-        return False
 
-    track = controller.build_track(connection, song_id)
-    play_queue.add_tracks([track])
-    logger.info(f'Queue was empty - added one similar song: {track.title} by {track.artist} [id={track.id}]')
-    return True
+def _similar_lookup_worker(play_queue, device_id: str, generation: int) -> None:
+    """Background thread body: find the waiting similar song.
+
+    Tries up to SIMILAR_LOOKUP_ATTEMPTS times, SIMILAR_LOOKUP_RETRY_SECONDS
+    apart. Stops early if the queue is flushed in the meantime (the
+    generation changes). Any unexpected error is logged with its
+    traceback, and the lookup is always marked finished so a later
+    trigger can start another.
+
+    :param play_queue: This device's MediaQueue instance
+    :param str device_id: The Alexa device ID for the current request
+    :param int generation: The generation state.start_lookup() returned
+    :return: None
+    """
+    try:
+        for attempt in range(1, SIMILAR_LOOKUP_ATTEMPTS + 1):
+            if state.get_generation(device_id) != generation:
+                logger.info('Similar-song lookup: the queue was flushed - abandoning the lookup')
+                return
+
+            song_id = _choose_similar_song(play_queue, device_id)
+
+            if song_id:
+                if state.set_waiting_song(device_id, song_id, generation):
+                    logger.info(f'Similar-song lookup: waiting song is {song_id} (attempt {attempt})')
+                else:
+                    logger.info('Similar-song lookup: the queue was flushed while looking - result discarded')
+                return
+
+            logger.info(f'Similar-song lookup: attempt {attempt} of {SIMILAR_LOOKUP_ATTEMPTS} found nothing')
+            if attempt < SIMILAR_LOOKUP_ATTEMPTS:
+                time.sleep(SIMILAR_LOOKUP_RETRY_SECONDS)
+
+        logger.warning(f'Similar-song lookup: gave up after {SIMILAR_LOOKUP_ATTEMPTS} attempts')
+
+    except Exception:
+        logger.exception('Similar-song lookup crashed')
+
+    finally:
+        state.finish_lookup(device_id, generation)
+
+
+def _start_similar_lookup(play_queue, device_id: str) -> None:
+    """Start looking for the waiting similar song in a background
+    thread, unless a song is already waiting or a lookup is already
+    running. Safe to call as often as needed.
+
+    :param play_queue: This device's MediaQueue instance
+    :param str device_id: The Alexa device ID for the current request
+    :return: None
+    """
+    generation = state.start_lookup(device_id)
+    if generation is None:
+        logger.debug('Similar-song lookup not needed: a song is already waiting or a lookup is running')
+        return
+
+    logger.info('Starting a background lookup for the next similar song')
+    try:
+        threading.Thread(
+            target=_similar_lookup_worker,
+            args=(play_queue, device_id, generation),
+            name='similar-song-lookup',
+            daemon=True,
+        ).start()
+    except Exception:
+        state.finish_lookup(device_id, generation)
+        raise
+
+
+def _ensure_next_track(play_queue, device_id: str) -> bool:
+    """Make sure the queue has something to play next, using the
+    waiting similar song if the queue is empty.
+
+    Runs under the device's lock so two requests arriving together
+    (for example NextIntent and PlaybackNearlyFinished) cannot both
+    add a song. The song is added through play_queue.add_tracks(),
+    which runs inside the manager process and sets the previous_id
+    that Alexa's ENQUEUE directive requires.
+
+    If the queue is empty and nothing is waiting, a lookup is started
+    and False is returned.
+
+    :param play_queue: This device's MediaQueue instance
+    :param str device_id: The Alexa device ID for the current request
+    :return: True if the queue now has a next track
+    :rtype: bool
+    """
+    with state.get_device_lock(device_id):
+        if play_queue.get_queue_count() > 0:
+            return True
+
+        song_id = state.take_waiting_song(device_id)
+
+        if not song_id:
+            logger.info('Queue is empty and no similar song is waiting yet')
+            _start_similar_lookup(play_queue, device_id)
+            return False
+
+        current = play_queue.get_current_track()
+        if current and current.id == song_id:
+            logger.info('The waiting similar song is the one already playing - discarding it')
+            _start_similar_lookup(play_queue, device_id)
+            return False
+
+        track = controller.build_track(connection, song_id)
+        play_queue.add_tracks([track])
+        logger.info(f'Queue was empty - added the waiting similar song: {track.title} by {track.artist} [id={track.id}]')
+        return True
 
 
 def queue_worker_thread(connection: object, play_queue: object, song_id_list: list) -> None:
@@ -358,7 +499,7 @@ def _add_search_to_queue(handler_input: HandlerInput, at_front: bool) -> Respons
     if not _something_is_playing(handler_input, play_queue):
         logger.info('Nothing is playing - treating this as a play request')
         state.stop_background_process(device_id)
-        play_queue.clear()
+        _flush_queue(play_queue, device_id)
         _start_background_fill(play_queue, device_id, song_id_list)
 
         speech = sanitise_speech_output(f'Playing {description}')
@@ -519,7 +660,7 @@ class NaviSonicPlayMusicByArtist(AbstractRequestHandler):
         else:
             artist_album_lookup = connection.albums_by_artist(artist_lookup[0].get('id'))
             song_id_list = connection.build_song_list_from_albums(artist_album_lookup, min_song_count)
-            play_queue.clear()
+            _flush_queue(play_queue, device_id)
 
             _start_background_fill(play_queue, device_id, song_id_list)
 
@@ -563,7 +704,7 @@ class NaviSonicShuffleArtist(AbstractRequestHandler):
         song_id_list = connection.build_song_list_from_albums(artist_album_lookup, -1)  # unlimited - full catalogue
         random.shuffle(song_id_list)
 
-        play_queue.clear()
+        _flush_queue(play_queue, device_id)
         _start_background_fill(play_queue, device_id, song_id_list)
 
         speech = sanitise_speech_output(f'Shuffling all songs by {artist.value}')
@@ -581,6 +722,9 @@ class NaviSonicPlaySimilar(AbstractRequestHandler):
     songs similar to it via Navidrome's similarity engine. This is the
     only place a batch of similar songs is queued up front - a plain
     "play X" plays only X.
+
+    Note: the similar-songs lookup here is made live, inside the
+    request, and has been seen to take about 6 seconds.
     """
 
     def can_handle(self, handler_input: HandlerInput) -> bool:
@@ -609,7 +753,7 @@ class NaviSonicPlaySimilar(AbstractRequestHandler):
         similar_ids = connection.get_similar_songs(song_id, 100)
         combined = [song_id] + [s for s in similar_ids if s != song_id]
 
-        play_queue.clear()
+        _flush_queue(play_queue, device_id)
 
         if len(combined) > 1:
             _start_background_fill(play_queue, device_id, combined)
@@ -666,7 +810,7 @@ class NaviSonicPlayMusicByDecade(AbstractRequestHandler):
 
         song_id_list = [s.get('id') for s in songs]
 
-        play_queue.clear()
+        _flush_queue(play_queue, device_id)
         _start_background_fill(play_queue, device_id, song_id_list)
 
         speech = sanitise_speech_output(f'Playing {description}')
@@ -718,7 +862,7 @@ class NaviSonicPlayAlbumByArtist(AbstractRequestHandler):
                     return handler_input.response_builder.response
 
                 song_id_list = connection.build_song_list_from_albums(result, -1)
-                play_queue.clear()
+                _flush_queue(play_queue, device_id)
                 _start_background_fill(play_queue, device_id, song_id_list)
 
                 speech = sanitise_speech_output(f'Playing {album.value} by: {artist.value}')
@@ -746,7 +890,7 @@ class NaviSonicPlayAlbumByArtist(AbstractRequestHandler):
 
                 song_id_list, description = expand_single_track_album(song_id_list, album.value)
 
-                play_queue.clear()
+                _flush_queue(play_queue, device_id)
                 _start_background_fill(play_queue, device_id, song_id_list)
 
                 speech = sanitise_speech_output(f'Playing {description}')
@@ -761,11 +905,11 @@ class NaviSonicPlayAlbumByArtist(AbstractRequestHandler):
 class NaviSonicPlaySearch(AbstractRequestHandler):
     """Handle NaviSonicPlaySearch
 
-    Free-text play: stops what is playing, flushes the queue, resolves
-    the query against songs, albums, artists, then genres (in that
-    priority order), and starts playback. A song match plays that one
-    song only; when the queue runs dry, similar songs are added one at
-    a time (see add_next_similar_song()).
+    Free-text play: stops what is playing, flushes the queue (and the
+    waiting similar song), resolves the query against songs, albums,
+    artists, then genres (in that priority order), and starts playback.
+    A song match plays that one song only; the next similar song is
+    found in the background (see _start_similar_lookup()).
     """
 
     def can_handle(self, handler_input: HandlerInput) -> bool:
@@ -785,7 +929,7 @@ class NaviSonicPlaySearch(AbstractRequestHandler):
             handler_input.response_builder.speak(text).ask(text)
             return handler_input.response_builder.response
 
-        play_queue.clear()
+        _flush_queue(play_queue, device_id)
         _start_background_fill(play_queue, device_id, song_id_list)
 
         speech = sanitise_speech_output(f'Playing {description}')
@@ -853,7 +997,7 @@ class NaviSonicPlayPlaylist(AbstractRequestHandler):
 
         else:
             song_id_list = connection.build_song_list_from_playlist(playlist_id)
-            play_queue.clear()
+            _flush_queue(play_queue, device_id)
             _start_background_fill(play_queue, device_id, song_id_list)
 
             speech = sanitise_speech_output('Playing playlist ' + str(playlist.value))
@@ -891,7 +1035,7 @@ class NaviSonicPlayMusicByGenre(AbstractRequestHandler):
 
         else:
             random.shuffle(song_id_list)
-            play_queue.clear()
+            _flush_queue(play_queue, device_id)
             _start_background_fill(play_queue, device_id, song_id_list)
 
             speech = sanitise_speech_output(f'Playing {genre.value} music')
@@ -928,7 +1072,7 @@ class NaviSonicPlayMusicRandom(AbstractRequestHandler):
 
         else:
             random.shuffle(song_id_list)
-            play_queue.clear()
+            _flush_queue(play_queue, device_id)
             _start_background_fill(play_queue, device_id, song_id_list)
 
             speech = sanitise_speech_output('Playing random music')
@@ -965,7 +1109,7 @@ class NaviSonicPlayFavouriteSongs(AbstractRequestHandler):
 
         else:
             random.shuffle(song_id_list)
-            play_queue.clear()
+            _flush_queue(play_queue, device_id)
             _start_background_fill(play_queue, device_id, song_id_list)
 
             speech = sanitise_speech_output('Playing your favourite tracks.')
@@ -1075,8 +1219,13 @@ class NaviSonicUnstarSong(AbstractRequestHandler):
 class PlaybackStartedHandler(AbstractRequestHandler):
     """AudioPlayer.PlaybackStarted Directive received.
 
-    Confirming that the requested audio file began playing.
-    Do not send any specific response.
+    Confirming that the requested audio file began playing. Do not
+    send any specific response.
+
+    This is also where the search for the waiting similar song begins
+    when nothing is queued behind the track that has just started -
+    which is always the case after a single-track "play X". The call is
+    harmless if a song is already waiting or a lookup is already running.
     """
 
     def can_handle(self, handler_input: HandlerInput) -> bool:
@@ -1085,6 +1234,12 @@ class PlaybackStartedHandler(AbstractRequestHandler):
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In PlaybackStartedHandler')
         logger.info('Playback started')
+
+        device_id = handler_input.request_envelope.context.system.device.device_id
+        play_queue = state.get_play_queue(device_id)
+
+        if play_queue.get_queue_count() == 0:
+            _start_similar_lookup(play_queue, device_id)
 
         return handler_input.response_builder.response
 
@@ -1117,10 +1272,14 @@ class PlaybackNearlyFinishedHandler(AbstractRequestHandler):
     """AudioPlayer.PlaybackNearlyFinished Directive received.
 
     Alexa asks for the next track a few seconds before the current one
-    ends. If nothing is queued, one similar song is chosen just in time
-    (see add_next_similar_song()), then the next track is handed to
-    Alexa. Handing it over also marks it as committed in the queue, so
-    that an insert arriving now goes behind it rather than ahead of it.
+    ends. If nothing is queued, the waiting similar song is moved into
+    the queue first. If there is still nothing, playback simply ends
+    after this track.
+
+    Handing the next track over also marks it as committed in the
+    queue, so an insert arriving now goes behind it rather than ahead
+    of it. If nothing is queued behind the track handed over, the
+    search for the next waiting song starts now.
     """
 
     def can_handle(self, handler_input: HandlerInput) -> bool:
@@ -1132,14 +1291,18 @@ class PlaybackNearlyFinishedHandler(AbstractRequestHandler):
         play_queue = state.get_play_queue(device_id)
 
         if len(play_queue.get_buffer()) == 0:
-            add_next_similar_song(play_queue, device_id, play_queue.get_current_track())
+            _ensure_next_track(play_queue, device_id)
 
         if len(play_queue.get_buffer()) == 0:
-            logger.info('Buffer still empty after adding a similar song - nothing more to queue')
+            logger.info('Nothing to hand to Alexa - playback will end after this track')
             return handler_input.response_builder.response
 
         logger.info('Queuing next track...')
         track_details = play_queue.enqueue_next_track()
+
+        if play_queue.get_queue_count() <= 1:
+            _start_similar_lookup(play_queue, device_id)
+
         return controller.start_playback('continue', None, None, track_details, handler_input)
 
 
@@ -1151,8 +1314,9 @@ class PlaybackFinishedHandler(AbstractRequestHandler):
     scrobbled and recorded in state, so that similar-song choices can
     be seeded from it and avoid repeating it.
 
-    If the queue is empty when a track finishes, one similar song is
-    added before advancing, rather than crashing on an empty deque.
+    The queue then moves on to the track Alexa has already been given.
+    Nothing is added to the queue here: finding a next song is done
+    earlier, in the background.
     """
 
     def can_handle(self, handler_input: HandlerInput) -> bool:
@@ -1169,13 +1333,10 @@ class PlaybackFinishedHandler(AbstractRequestHandler):
         state.record_finished_track(device_id, current_track.id)
         logger.info(f'Recorded finished track: {current_track.title} by {current_track.artist} [id={current_track.id}]')
 
-        if play_queue.get_queue_count() == 0:
-            add_next_similar_song(play_queue, device_id, current_track)
-
         if play_queue.get_queue_count() > 0:
             play_queue.get_next_track()
         else:
-            logger.info('Queue is empty and no similar song was found - nothing left to play')
+            logger.info('Queue is empty - nothing left to play')
 
         return handler_input.response_builder.response
 
@@ -1233,11 +1394,11 @@ class ResumePlaybackHandler(AbstractRequestHandler):
 class NextPlaybackHandler(AbstractRequestHandler):
     """Handle NextIntent.
 
-    If the queue is empty when "next" is requested, one similar song is
-    added first. If that also fails, respond gracefully rather than
-    crashing - speaking only for the voice-intent case, since
-    PlaybackController.NextCommandIssued (a hardware/touch button
-    event) cannot carry outputSpeech.
+    If the queue is empty when "next" is requested, the waiting similar
+    song is moved into the queue first. If nothing is waiting yet, say
+    so (voice only - PlaybackController.NextCommandIssued, a
+    hardware/touch button event, cannot carry outputSpeech) and make
+    sure a lookup is running.
     """
 
     def can_handle(self, handler_input: HandlerInput) -> bool:
@@ -1251,12 +1412,12 @@ class NextPlaybackHandler(AbstractRequestHandler):
         logger.debug(f'Queue count before next: {play_queue.get_queue_count()}')
 
         if play_queue.get_queue_count() == 0:
-            add_next_similar_song(play_queue, device_id, play_queue.get_current_track())
+            _ensure_next_track(play_queue, device_id)
 
         if play_queue.get_queue_count() == 0:
-            logger.info('Nothing left to play after trying to add a similar song')
+            logger.info('Nothing queued and no similar song waiting yet')
             if is_intent_name('AMAZON.NextIntent')(handler_input):
-                text = sanitise_speech_output("There's nothing else queued up.")
+                text = sanitise_speech_output("I'm still finding the next song, try again in a few seconds.")
                 handler_input.response_builder.speak(text)
             return handler_input.response_builder.response
 
@@ -1297,7 +1458,8 @@ class PlaybackFailedEventHandler(AbstractRequestHandler):
     """AudioPlayer.PlaybackFailed Directive received.
 
     Logging the error and moving on to the next track with no output
-    speech. If the queue is empty, one similar song is added first.
+    speech. If the queue is empty, the waiting similar song is moved
+    into it first.
     """
 
     def can_handle(self, handler_input: HandlerInput) -> bool:
@@ -1315,10 +1477,10 @@ class PlaybackFailedEventHandler(AbstractRequestHandler):
         logger.error(f'Failed playing track with ID: {song_id}')
 
         if play_queue.get_queue_count() == 0:
-            add_next_similar_song(play_queue, device_id, current_track)
+            _ensure_next_track(play_queue, device_id)
 
         if play_queue.get_queue_count() == 0:
-            logger.info('Nothing left to play after a playback failure and trying to add a similar song')
+            logger.info('Nothing left to play after a playback failure')
             return handler_input.response_builder.response
 
         track_details = play_queue.get_next_track()

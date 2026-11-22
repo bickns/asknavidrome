@@ -15,13 +15,23 @@ deployment this is an acceptable, deliberate simplification rather
 than an oversight - each idle queue costs a handful of empty deques
 in the manager subprocess, not meaningfully more.
 
-This module also keeps a short, bounded, in-memory list of the tracks
-each device has recently FINISHED playing. It is used when the queue
-runs dry, to choose the next similar song: recent tracks seed the
-choice, and the same list is used to avoid repeating anything heard
-lately. It lives in the web service process (not the manager process),
-is capped at RECENT_PLAYS_MAX entries per device, and is lost on
-restart - which is fine for a window measured in minutes.
+This module also keeps, per device and in the web service process
+(not the manager process):
+
+- a short, bounded list of the tracks the device recently FINISHED
+  playing. Recent tracks seed the choice of the next similar song, and
+  the same list stops a suggestion repeating anything heard lately.
+
+- ONE "waiting song": the similar song that has been chosen in the
+  background and will be added to the queue when the queue runs dry.
+  It is only a song ID, never a queue entry, so it can't get in the
+  way of anything the user queues or inserts. A "generation" counter
+  lets a flush of the queue (a new "play X") discard the waiting song
+  and make any lookup still running for the old song throw its result
+  away.
+
+Everything here is lost on restart, which is fine: the list covers a
+window of minutes and the waiting song is found again within seconds.
 """
 
 from multiprocessing.managers import BaseManager
@@ -34,7 +44,7 @@ BaseManager.register('MediaQueue', queue.MediaQueue)
 manager = BaseManager()
 manager.start()
 
-RECENT_PLAYS_WINDOW_SECONDS = 15 * 60
+RECENT_PLAYS_WINDOW_SECONDS = 30 * 60
 """A finished track only counts as a similarity SEED for this long."""
 
 RECENT_PLAYS_MAX = 10
@@ -57,6 +67,27 @@ _recent_by_device = {}
 _recent_lock = threading.Lock()
 """gunicorn runs several threads in this one process; the recent-plays
 lists are mutated and read from different threads, so access is locked."""
+
+_waiting_by_device = {}
+"""device_id -> song ID of the similar song waiting to be queued"""
+
+_generation_by_device = {}
+"""device_id -> integer that goes up each time the waiting song is
+discarded (i.e. whenever the queue is flushed)"""
+
+_lookup_running = {}
+"""device_id -> the generation a background lookup is currently
+running for. Only a lookup for the CURRENT generation blocks a new one,
+so a flush is never held up by a lookup for the old song."""
+
+_waiting_lock = threading.Lock()
+"""Guards _waiting_by_device, _generation_by_device and _lookup_running."""
+
+_device_locks = {}
+"""device_id -> Lock held while moving the waiting song into the queue"""
+
+_device_locks_guard = threading.Lock()
+"""Guards _device_locks."""
 
 
 def get_play_queue(device_id: str):
@@ -160,3 +191,128 @@ def get_recent_track_ids(device_id: str, limit: int = None, max_age_seconds: int
         if limit is not None and len(ids) >= limit:
             break
     return ids
+
+
+def get_device_lock(device_id: str):
+    """Get this device's lock, creating it on first use.
+
+    Held while the waiting song is checked for and moved into the
+    queue, so two requests arriving together (for example NextIntent
+    and PlaybackNearlyFinished) cannot both add a song.
+
+    :param str device_id: The Alexa device ID for the current request
+    :return: A threading.Lock
+    :rtype: threading.Lock
+    """
+    with _device_locks_guard:
+        lock = _device_locks.get(device_id)
+        if lock is None:
+            lock = threading.Lock()
+            _device_locks[device_id] = lock
+        return lock
+
+
+def get_generation(device_id: str) -> int:
+    """Get the current waiting-song generation for this device.
+
+    :param str device_id: The Alexa device ID for the current request
+    :return: The generation number (0 until the first flush)
+    :rtype: int
+    """
+    with _waiting_lock:
+        return _generation_by_device.get(device_id, 0)
+
+
+def start_lookup(device_id: str):
+    """Claim the right to start a background lookup for the waiting song.
+
+    Refused (None) if a song is already waiting, or if a lookup for the
+    current generation is already running. Otherwise the lookup is
+    recorded as running and the current generation is returned, which
+    the lookup must pass back to set_waiting_song() and finish_lookup().
+
+    :param str device_id: The Alexa device ID for the current request
+    :return: The generation to run the lookup for, or None if not needed
+    :rtype: int | None
+    """
+    with _waiting_lock:
+        if _waiting_by_device.get(device_id):
+            return None
+
+        generation = _generation_by_device.get(device_id, 0)
+        if _lookup_running.get(device_id) == generation:
+            return None
+
+        _lookup_running[device_id] = generation
+        return generation
+
+
+def finish_lookup(device_id: str, generation: int) -> None:
+    """Record that a background lookup has finished (found a song or gave up).
+
+    Only clears the record if it belongs to the same generation, so a
+    stale lookup finishing late cannot clear a newer lookup's record.
+
+    :param str device_id: The Alexa device ID for the current request
+    :param int generation: The generation start_lookup() returned
+    :return: None
+    """
+    with _waiting_lock:
+        if _lookup_running.get(device_id) == generation:
+            del _lookup_running[device_id]
+
+
+def set_waiting_song(device_id: str, song_id: str, generation: int) -> bool:
+    """Store the song found by a background lookup.
+
+    Ignored (False) if the generation has moved on, which means the
+    queue was flushed while the lookup was running and the song was
+    chosen for something that is no longer playing.
+
+    :param str device_id: The Alexa device ID for the current request
+    :param str song_id: The Navidrome ID of the chosen song
+    :param int generation: The generation the lookup was started for
+    :return: True if the song was stored, False if it was discarded as stale
+    :rtype: bool
+    """
+    with _waiting_lock:
+        if generation != _generation_by_device.get(device_id, 0):
+            return False
+        _waiting_by_device[device_id] = song_id
+        return True
+
+
+def has_waiting_song(device_id: str) -> bool:
+    """Is a similar song waiting for this device?
+
+    :param str device_id: The Alexa device ID for the current request
+    :return: True if a song is waiting
+    :rtype: bool
+    """
+    with _waiting_lock:
+        return bool(_waiting_by_device.get(device_id))
+
+
+def take_waiting_song(device_id: str):
+    """Remove and return the waiting song, if there is one.
+
+    :param str device_id: The Alexa device ID for the current request
+    :return: The song ID, or None if nothing is waiting
+    :rtype: str | None
+    """
+    with _waiting_lock:
+        return _waiting_by_device.pop(device_id, None)
+
+
+def discard_waiting_song(device_id: str) -> None:
+    """Throw away the waiting song and invalidate any lookup in progress.
+
+    Called whenever the queue is flushed for a new "play": the old
+    suggestion was chosen to follow something that no longer applies.
+
+    :param str device_id: The Alexa device ID for the current request
+    :return: None
+    """
+    with _waiting_lock:
+        _waiting_by_device.pop(device_id, None)
+        _generation_by_device[device_id] = _generation_by_device.get(device_id, 0) + 1
