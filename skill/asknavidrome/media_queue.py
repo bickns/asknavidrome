@@ -173,18 +173,6 @@ class MediaQueue:
 
         self.logger.debug(f'In add_tracks() - added {len(tracks)} tracks (at_front={at_front}), {len(self.queue)} now in the queue')
 
-    def set_first_previous_id(self, previous_id: str) -> None:
-        """Set the previous_id of the first track currently in the queue.
-
-        No longer used by the skill (add_tracks() rebuilds the whole
-        previous_id chain) but retained.
-
-        :param str previous_id: The ID to set as the first track's previous_id
-        :return: None
-        """
-        if self.queue:
-            self.queue[0].previous_id = previous_id
-
     def shuffle(self) -> None:
         """Shuffle the queue
 
