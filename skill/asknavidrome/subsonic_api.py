@@ -101,8 +101,11 @@ class SubsonicConnection:
 
         playlist_dict = self.conn.getPlaylists()
 
+        # Navidrome omits the 'playlist' key entirely when there are no playlists
+        playlists = playlist_dict.get('playlists', {}).get('playlist', [])
+
         # Search the list of dictionaries for a playlist with a name that matches the search term
-        playlist_id_list = [item.get('id') for item in playlist_dict['playlists']['playlist'] if item.get('name').lower() == term.lower()]
+        playlist_id_list = [item.get('id') for item in playlists if (item.get('name') or '').lower() == term.lower()]
 
         if len(playlist_id_list) == 1:
             # We have matched the playlist return it
@@ -208,15 +211,23 @@ class SubsonicConnection:
     def albums_by_artist(self, id: str) -> 'list[dict]':
         """Get the albums for a given artist
 
+        Navidrome omits the 'album' key for an artist with no albums of
+        their own, so an empty list is returned in that case (callers must
+        handle it) rather than raising.
+
         :param str id: The artist ID
-        :return: A list of albums
+        :return: A list of albums (may be empty)
         :rtype: list of dict
         """
 
         self.logger.debug('In function albums_by_artist()')
 
         result_dict = self.conn.getArtist(id)
-        album_list = result_dict['artist'].get('album')
+        album_list = result_dict.get('artist', {}).get('album', [])
+
+        if not album_list:
+            self.logger.warning(f'albums_by_artist: artist {id} has no albums (response keys: {list(result_dict.get("artist", {}).keys())})')
+            return []
 
         # Shuffle the album list to keep generic requests fresh
         random.shuffle(album_list)
@@ -258,7 +269,7 @@ class SubsonicConnection:
                 if song_count < int(length):
                     # We need more songs
                     album_id_list.append(album.get('id'))
-                    song_count = song_count + album.get('songCount')
+                    song_count = song_count + (album.get('songCount') or 0)
                 else:
                     # We have enough songs, stop iterating
                     break
@@ -277,7 +288,7 @@ class SubsonicConnection:
         # Get a song listing for each album
         for album_id in album_id_list:
             album_details = self.conn.getAlbum(album_id)
-            songs = album_details['album']['song']
+            songs = album_details.get('album', {}).get('song', [])
 
             self.logger.debug(f'build_song_list_from_albums: album {album_id} returned {len(songs)} songs')
             for s in songs:
@@ -313,7 +324,7 @@ class SubsonicConnection:
         song_id_list = []
         playlist_details = self.conn.getPlaylist(id)
 
-        song_id_list = [song_detail.get('id') for song_detail in playlist_details.get('playlist').get('entry')]
+        song_id_list = [song_detail.get('id') for song_detail in playlist_details.get('playlist', {}).get('entry', [])]
 
         return song_id_list
 
@@ -326,7 +337,7 @@ class SubsonicConnection:
 
         self.logger.debug('In function build_song_list_from_favourites()')
 
-        favourite_songs = self.conn.getStarred2().get('starred2').get('song')
+        favourite_songs = self.conn.getStarred2().get('starred2', {}).get('song', [])
 
         if len(favourite_songs) > 0:
             song_id_list = [song.get('id') for song in favourite_songs]
@@ -350,7 +361,7 @@ class SubsonicConnection:
         # Note the use of title() to capitalise the first letter of each word in the genre
         # without this the genres do not match the strings returned by the API.
         self.logger.debug(f'Searching for {genre.title()} music')
-        songs_from_genre = self.conn.getSongsByGenre(genre.title(), count).get('songsByGenre').get('song')
+        songs_from_genre = self.conn.getSongsByGenre(genre.title(), count).get('songsByGenre', {}).get('song', [])
 
         if len(songs_from_genre) > 0:
             song_id_list = [song.get('id') for song in songs_from_genre]
@@ -369,7 +380,7 @@ class SubsonicConnection:
         """
 
         self.logger.debug('In function build_random_song_list()')
-        random_songs = self.conn.getRandomSongs(count).get('randomSongs').get('song')
+        random_songs = self.conn.getRandomSongs(count).get('randomSongs', {}).get('song', [])
 
         if len(random_songs) > 0:
             song_id_list = [song.get('id') for song in random_songs]
