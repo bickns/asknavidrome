@@ -4,7 +4,7 @@ Search handlers: the intents where the user names something to play.
   play X                    NaviSonicPlaySearch   flush the queue, play X
   queue X                   NaviSonicQueueSearch  add X to the END of the queue
   insert X                  NaviSonicInsertSearch add X to the FRONT of the queue
-  play X and similar songs  NaviSonicPlaySimilar  flush, play X, pre-load similar songs
+  play X and similar songs  NaviSonicPlaySimilar  flush, play X (similar songs follow)
 
 If nothing is playing, queue and insert behave like play.
 
@@ -151,13 +151,12 @@ class NaviSonicInsertSearch(AbstractRequestHandler):
 class NaviSonicPlaySimilar(AbstractRequestHandler):
     """Handle NaviSonicPlaySimilar ("play X and similar songs")
 
-    Play the song, then pre-load a batch of songs similar to it via
-    Navidrome's similarity engine. This is the only place a batch of
-    similar songs is queued up front - a plain "play X" plays only X.
+    Play the song. Similar songs follow automatically: once playback has
+    started, PlaybackStartedHandler begins the background lookup for the
+    next similar song, exactly as it does after a plain "play X".
 
-    Note: the similar-songs lookup here is made live, inside the
-    request, and has been seen to take about 6 seconds, which is close
-    to Alexa's 8 second limit.
+    The lookup is NOT made inside this request - it takes about 6 seconds,
+    which is too close to Alexa's 8 second limit.
     """
 
     def can_handle(self, handler_input: HandlerInput) -> bool:
@@ -174,16 +173,9 @@ class NaviSonicPlaySimilar(AbstractRequestHandler):
             return reply_not_found(handler_input, f"I couldn't find {song.value} in your library.")
 
         best_match = best_song_match(song.value, song_results)[0]
-        song_id = best_match.get('id')
         song_title = best_match.get('title', song.value)
         song_artist = best_match.get('artist', 'an unknown artist')
 
-        similar_ids = connection.get_similar_songs(song_id, 100)
-        combined = [song_id] + [s for s in similar_ids if s != song_id]
+        speech = f'Playing {song_title} by {song_artist} and similar songs'
 
-        if len(combined) > 1:
-            speech = f'Playing {song_title} by {song_artist} and similar songs'
-        else:
-            speech = f'Playing {song_title} by {song_artist}'
-
-        return start_playing(handler_input, device_id, play_queue, combined, speech)
+        return start_playing(handler_input, device_id, play_queue, [best_match.get('id')], speech)

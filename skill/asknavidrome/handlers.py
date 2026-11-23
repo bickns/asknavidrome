@@ -1,32 +1,26 @@
 """
-Request handlers for the AskNavidrome Alexa skill.
+Compatibility shim. The handlers live in four files:
 
-The handlers used to live in this one large file. They are now split
-by how often they change:
+    handlers_search.py       play / queue / insert / play-similar by name
+    handlers_collections.py  playlist, genre, decade, random, favourites, shuffle artist
+    handlers_standard.py     launch, help, pause/resume/next/previous, AudioPlayer events
+    helpers.py               shared helper functions
 
-  helpers.py               shared functions used by every handler
-  similar.py               finding the next similar song in the background
-  handlers_search.py       play / queue / insert / play-and-similar
-  handlers_collections.py  playlist, genre, decade, random, favourites, shuffle artist
-  handlers_standard.py     launch, help, controls, AudioPlayer events
-
-This file only re-exports them, so app.py (which does
-`from asknavidrome import handlers as h`) and exception_handlers.py
-(which imports sanitise_speech_output from here) keep working unchanged.
+This file only re-exports them, so that app.py (from asknavidrome import
+handlers as h) and exception_handlers.py keep working unchanged.
 Nothing is defined here.
 """
 
-from asknavidrome.helpers import (
-    sanitise_speech_output,
-    log_incoming_request,
-)
-from asknavidrome.handlers_search import (
+from asknavidrome.helpers import sanitise_speech_output, log_incoming_request  # noqa: F401
+
+from asknavidrome.handlers_search import (  # noqa: F401
     NaviSonicPlaySearch,
     NaviSonicQueueSearch,
     NaviSonicInsertSearch,
     NaviSonicPlaySimilar,
 )
-from asknavidrome.handlers_collections import (
+
+from asknavidrome.handlers_collections import (  # noqa: F401
     NaviSonicShuffleArtist,
     NaviSonicPlayMusicByDecade,
     NaviSonicPlayPlaylist,
@@ -34,7 +28,8 @@ from asknavidrome.handlers_collections import (
     NaviSonicPlayMusicRandom,
     NaviSonicPlayFavouriteSongs,
 )
-from asknavidrome.handlers_standard import (
+
+from asknavidrome.handlers_standard import (  # noqa: F401
     LaunchRequestHandler,
     CheckAudioInterfaceHandler,
     SkillEventHandler,
@@ -54,36 +49,3 @@ from asknavidrome.handlers_standard import (
     PlaybackFinishedHandler,
     PlaybackFailedEventHandler,
 )
-
-__all__ = [
-    'sanitise_speech_output',
-    'log_incoming_request',
-    'NaviSonicPlaySearch',
-    'NaviSonicQueueSearch',
-    'NaviSonicInsertSearch',
-    'NaviSonicPlaySimilar',
-    'NaviSonicShuffleArtist',
-    'NaviSonicPlayMusicByDecade',
-    'NaviSonicPlayPlaylist',
-    'NaviSonicPlayMusicByGenre',
-    'NaviSonicPlayMusicRandom',
-    'NaviSonicPlayFavouriteSongs',
-    'LaunchRequestHandler',
-    'CheckAudioInterfaceHandler',
-    'SkillEventHandler',
-    'HelpHandler',
-    'FallbackHandler',
-    'NaviSonicRandomiseQueue',
-    'NaviSonicSongDetails',
-    'NaviSonicStarSong',
-    'NaviSonicUnstarSong',
-    'PausePlaybackHandler',
-    'ResumePlaybackHandler',
-    'NextPlaybackHandler',
-    'PreviousPlaybackHandler',
-    'PlaybackStartedHandler',
-    'PlaybackStoppedHandler',
-    'PlaybackNearlyFinishedHandler',
-    'PlaybackFinishedHandler',
-    'PlaybackFailedEventHandler',
-]
