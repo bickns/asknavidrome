@@ -19,6 +19,7 @@ exists specifically to prevent that loop.
 """
 
 import traceback
+import urllib.error
 
 from ask_sdk_core.dispatch_components import AbstractExceptionHandler
 from ask_sdk_core.handler_input import HandlerInput
@@ -44,6 +45,37 @@ def _request_forbids_speech(handler_input: HandlerInput) -> bool:
     return (req_type.startswith('AudioPlayer.') or
             req_type.startswith('PlaybackController.') or
             req_type == 'System.ExceptionEncountered')
+
+
+def _is_connectivity_error(exception: BaseException) -> bool:
+    """Is this exception (or anything it was raised from) a failure to
+    reach Navidrome, rather than a bug or a "not found"?
+
+    Counts as connectivity: a timeout, a refused or reset connection,
+    a URL error (DNS failure, no route, TLS failure), or an HTTP 5xx
+    reply (e.g. the 502 Caddy returns when it cannot reach Navidrome).
+    An HTTP 4xx reply is NOT connectivity - the server answered.
+
+    The exception's __cause__ / __context__ chain is followed, in case
+    the original error was wrapped.
+
+    :param exception: The exception being handled
+    :return: True if it looks like Navidrome could not be reached
+    :rtype: bool
+    """
+    seen = set()
+    while exception is not None and id(exception) not in seen:
+        seen.add(id(exception))
+
+        if isinstance(exception, urllib.error.HTTPError):
+            if exception.code >= 500:
+                return True
+        elif isinstance(exception, (urllib.error.URLError, TimeoutError, ConnectionError)):
+            return True
+
+        exception = exception.__cause__ or exception.__context__
+
+    return False
 
 
 def get_slot_summary(handler_input: HandlerInput) -> str:
@@ -135,7 +167,9 @@ class GeneralExceptionHandler(AbstractExceptionHandler):
     Handles exceptions and prints error information, including a full
     traceback and the device that triggered it, in the log. Same
     speech-forbidding-request-type guard and slot-summary speech as
-    SystemExceptionHandler above.
+    SystemExceptionHandler above. A failure to reach Navidrome (see
+    _is_connectivity_error()) gets a fixed spoken reply instead of the
+    "couldn't find ..." message, because nothing was actually looked up.
     """
 
     def can_handle(self, handler_input: HandlerInput, exception: Exception) -> bool:
@@ -152,6 +186,11 @@ class GeneralExceptionHandler(AbstractExceptionHandler):
 
         if _request_forbids_speech(handler_input):
             logger.warning('Exception occurred on a directive-only request type - returning empty response without speech')
+            return handler_input.response_builder.response
+
+        if _is_connectivity_error(exception):
+            logger.warning('Could not reach Navidrome - telling the user')
+            handler_input.response_builder.speak("I'm having trouble reaching your sounds.")
             return handler_input.response_builder.response
 
         slot_summary = get_slot_summary(handler_input)
